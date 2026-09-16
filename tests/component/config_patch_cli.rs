@@ -124,7 +124,7 @@ fn test_state(config: Config) -> AppState {
         canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
         #[cfg(feature = "webauthn")]
         webauthn: None,
-        cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        active_turns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         tui_registry: None,
         sop_engine: None,
