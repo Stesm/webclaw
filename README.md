@@ -8,6 +8,11 @@
   <strong>You own the agent. You own the data. You own the machine it runs on.</strong>
 </p>
 
+> **This is a fork.** [`Stesm/webclaw`](https://github.com/Stesm/webclaw) is a fork
+> of the upstream project
+> [**zeroclaw-labs/zeroclaw**](https://github.com/zeroclaw-labs/zeroclaw), tuned
+> for the **web client**. See [Fork differences](#fork-differences).
+
 <p align="center">
   <a href="https://github.com/zeroclaw-labs/zeroclaw/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/zeroclaw-labs/zeroclaw/ci.yml?branch=master&label=build" alt="Build Status" /></a>
   <a href="https://github.com/zeroclaw-labs/zeroclaw/releases/latest"><img src="https://img.shields.io/github/v/release/zeroclaw-labs/zeroclaw?label=release" alt="Latest release" /></a>
@@ -165,13 +170,22 @@ AI-assisted PRs are welcome; see [Contribution culture (RFC #5615)](https://gith
 
 Do not file public issues for security vulnerabilities. Email `security@zeroclaw.dev`. See [SECURITY.md](SECURITY.md) for the full policy.
 
-## Official repository & impersonation notice
+## Fork differences
 
-This is the only official ZeroClaw repository:
+This fork ([`Stesm/webclaw`](https://github.com/Stesm/webclaw)) keeps the upstream runtime and adds a web-first workflow:
+
+- **No channel required** — run the agent entirely through the gateway web client; no Discord/Telegram/Matrix/email adapter needed.
+- **Background agents** — agents keep running server-side after a client disconnects, exactly as when driven from a client app.
+- **Extended dialog list** — a richer session list in the dashboard: first-message preview, inline rename, and a deep-link straight into the chat.
+- **Agent-sent attachments with previews** — the agent can send files to the client, shown as inline cards with a preview modal.
+
+## Upstream & impersonation notice
+
+The upstream project is maintained at:
 
 > <https://github.com/zeroclaw-labs/zeroclaw>
 
-Any other repository, organization, domain, or package claiming to be "ZeroClaw" or implying affiliation with ZeroClaw Labs is **unauthorized and not affiliated with this project**.
+This fork is an independent, unaffiliated derivative of that project. The **ZeroClaw** name and logo remain trademarks of ZeroClaw Labs.
 
 ## License
 
