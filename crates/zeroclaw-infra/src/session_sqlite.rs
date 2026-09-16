@@ -10,6 +10,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, pa
 use sha2::{Digest, Sha256};
 use std::io::{self, BufRead, Read};
 use std::path::{Path, PathBuf};
+use zeroclaw_api::agent::AttachmentRef;
 use zeroclaw_api::model_provider::ChatMessage;
 
 /// SQLite-backed session store with FTS5 and WAL mode.
@@ -150,8 +151,14 @@ impl SqliteSessionBackend {
                 "ALTER TABLE session_metadata ADD COLUMN sender_id TEXT",
             ),
         ] {
-            Self::ensure_metadata_column(&conn, column, ddl)?;
+            Self::ensure_table_column(&conn, "session_metadata", column, ddl)?;
         }
+        Self::ensure_table_column(
+            &conn,
+            "sessions",
+            "attachments",
+            "ALTER TABLE sessions ADD COLUMN attachments TEXT",
+        )?;
         for (index, ddl) in [
             (
                 "idx_session_metadata_agent_alias",
@@ -183,18 +190,17 @@ impl SqliteSessionBackend {
         })
     }
 
-    fn ensure_metadata_column(conn: &Connection, column: &str, ddl: &str) -> Result<()> {
+    fn ensure_table_column(conn: &Connection, table: &str, column: &str, ddl: &str) -> Result<()> {
         let present: bool = conn
             .query_row(
-                "SELECT COUNT(*) > 0 FROM pragma_table_info('session_metadata') \
-                 WHERE name = ?1",
+                &format!("SELECT COUNT(*) > 0 FROM pragma_table_info('{table}') WHERE name = ?1"),
                 params![column],
                 |row| row.get(0),
             )
-            .with_context(|| format!("Failed to inspect session metadata column {column}"))?;
+            .with_context(|| format!("Failed to inspect {table} column {column}"))?;
         if !present {
             conn.execute(ddl, [])
-                .with_context(|| format!("Failed to add session metadata column {column}"))?;
+                .with_context(|| format!("Failed to add {table} column {column}"))?;
         }
         Ok(())
     }
@@ -203,12 +209,19 @@ impl SqliteSessionBackend {
         conn: &Connection,
         session_key: &str,
         message: &ChatMessage,
+        attachments_json: Option<&str>,
         now: &str,
     ) -> rusqlite::Result<()> {
         conn.execute(
-            "INSERT INTO sessions (session_key, role, content, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![session_key, message.role, message.content, now],
+            "INSERT INTO sessions (session_key, role, content, created_at, attachments)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                session_key,
+                message.role,
+                message.content,
+                now,
+                attachments_json
+            ],
         )?;
         conn.execute(
             "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count)
@@ -760,6 +773,26 @@ impl SqliteSessionBackend {
     }
 }
 
+/// First non-empty `user` row for `session_key`, bounded and collapsed into a
+/// preview. Caller must already hold the connection lock.
+fn first_user_message_preview_locked(conn: &Connection, session_key: &str) -> Option<String> {
+    #[allow(clippy::cast_possible_wrap)]
+    let source_max = crate::session_backend::SESSION_PREVIEW_SOURCE_MAX_CHARS as i64;
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT SUBSTR(content, 1, ?2) FROM sessions
+              WHERE session_key = ?1 AND role = 'user' AND TRIM(content) <> ''
+              ORDER BY id ASC LIMIT 1",
+            params![session_key, source_max],
+            |row| row.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    raw.as_deref()
+        .and_then(crate::session_backend::normalize_session_preview)
+}
+
 impl SessionBackend for SqliteSessionBackend {
     fn load(&self, session_key: &str) -> Vec<ChatMessage> {
         let conn = self.conn.lock();
@@ -790,7 +823,7 @@ impl SessionBackend for SqliteSessionBackend {
         use crate::session_backend::TimestampedMessage;
         let conn = self.conn.lock();
         let mut stmt = match conn.prepare(
-            "SELECT role, content, created_at FROM sessions WHERE session_key = ?1 ORDER BY id ASC",
+            "SELECT role, content, created_at, attachments FROM sessions WHERE session_key = ?1 ORDER BY id ASC",
         ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
@@ -804,9 +837,15 @@ impl SessionBackend for SqliteSessionBackend {
                 .as_deref()
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                 .map(|dt| dt.with_timezone(&Utc));
+            let attachments_raw: Option<String> = row.get(3).ok();
+            let attachments: Vec<AttachmentRef> = attachments_raw
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
             Ok(TimestampedMessage {
                 message: ChatMessage { role, content },
                 created_at,
+                attachments,
             })
         }) {
             Ok(r) => r,
@@ -819,7 +858,27 @@ impl SessionBackend for SqliteSessionBackend {
     fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
         let conn = self.conn.lock();
         let now = Utc::now().to_rfc3339();
-        Self::append_on(&conn, session_key, message, &now).map_err(std::io::Error::other)
+        Self::append_on(&conn, session_key, message, None, &now).map_err(std::io::Error::other)
+    }
+
+    fn append_with_attachments(
+        &self,
+        session_key: &str,
+        message: &ChatMessage,
+        attachments: &[AttachmentRef],
+    ) -> std::io::Result<()> {
+        let conn = self.conn.lock();
+        let now = Utc::now().to_rfc3339();
+        let attachments_json = (!attachments.is_empty())
+            .then(|| serde_json::to_string(attachments).unwrap_or_default());
+        Self::append_on(
+            &conn,
+            session_key,
+            message,
+            attachments_json.as_deref(),
+            &now,
+        )
+        .map_err(std::io::Error::other)
     }
 
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
@@ -909,14 +968,20 @@ impl SessionBackend for SqliteSessionBackend {
     fn list_sessions_with_metadata(&self) -> Vec<SessionMetadata> {
         let conn = self.conn.lock();
         let mut stmt = match conn.prepare(
-            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id
-             FROM session_metadata ORDER BY last_activity DESC",
+            "SELECT m.session_key, m.created_at, m.last_activity, m.message_count, m.name, m.agent_alias, m.channel_id, m.room_id, m.sender_id,
+                    (SELECT SUBSTR(s.content, 1, ?1)
+                       FROM sessions s
+                      WHERE s.session_key = m.session_key AND s.role = 'user' AND TRIM(s.content) <> ''
+                      ORDER BY s.id ASC LIMIT 1)
+             FROM session_metadata m ORDER BY m.last_activity DESC",
         ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
 
-        let rows = match stmt.query_map([], |row| {
+        #[allow(clippy::cast_possible_wrap)]
+        let source_max = crate::session_backend::SESSION_PREVIEW_SOURCE_MAX_CHARS as i64;
+        let rows = match stmt.query_map(params![source_max], |row| {
             let key: String = row.get(0)?;
             let created_str: String = row.get(1)?;
             let activity_str: String = row.get(2)?;
@@ -926,6 +991,7 @@ impl SessionBackend for SqliteSessionBackend {
             let channel_id: Option<String> = row.get(6)?;
             let room_id: Option<String> = row.get(7)?;
             let sender_id: Option<String> = row.get(8)?;
+            let raw_preview: Option<String> = row.get(9)?;
 
             let created = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
@@ -945,6 +1011,9 @@ impl SessionBackend for SqliteSessionBackend {
                 channel_id,
                 room_id,
                 sender_id,
+                preview: raw_preview
+                    .as_deref()
+                    .and_then(crate::session_backend::normalize_session_preview),
             })
         }) {
             Ok(r) => r,
@@ -1105,43 +1174,49 @@ impl SessionBackend for SqliteSessionBackend {
 
     fn get_session_metadata(&self, session_key: &str) -> Option<SessionMetadata> {
         let conn = self.conn.lock();
-        conn.query_row(
-            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id
-             FROM session_metadata WHERE session_key = ?1",
-            params![session_key],
-            |row| {
-                let key: String = row.get(0)?;
-                let created_str: String = row.get(1)?;
-                let activity_str: String = row.get(2)?;
-                let count: i64 = row.get(3)?;
-                let name: Option<String> = row.get(4)?;
-                let agent_alias: Option<String> = row.get(5)?;
-                let channel_id: Option<String> = row.get(6)?;
-                let room_id: Option<String> = row.get(7)?;
-                let sender_id: Option<String> = row.get(8)?;
+        let mut meta = conn
+            .query_row(
+                "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id
+                 FROM session_metadata WHERE session_key = ?1",
+                params![session_key],
+                |row| {
+                    let key: String = row.get(0)?;
+                    let created_str: String = row.get(1)?;
+                    let activity_str: String = row.get(2)?;
+                    let count: i64 = row.get(3)?;
+                    let name: Option<String> = row.get(4)?;
+                    let agent_alias: Option<String> = row.get(5)?;
+                    let channel_id: Option<String> = row.get(6)?;
+                    let room_id: Option<String> = row.get(7)?;
+                    let sender_id: Option<String> = row.get(8)?;
 
-                let created = DateTime::parse_from_rfc3339(&created_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now());
-                let activity = DateTime::parse_from_rfc3339(&activity_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now());
+                    let created = DateTime::parse_from_rfc3339(&created_str)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .unwrap_or_else(|_| Utc::now());
+                    let activity = DateTime::parse_from_rfc3339(&activity_str)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .unwrap_or_else(|_| Utc::now());
 
-                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-                Ok(SessionMetadata {
-                    key,
-                    name,
-                    created_at: created,
-                    last_activity: activity,
-                    message_count: count as usize,
-                    agent_alias,
-                    channel_id,
-                    room_id,
-                    sender_id,
-                })
-            },
-        )
-        .ok()
+                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                    Ok(SessionMetadata {
+                        key,
+                        name,
+                        created_at: created,
+                        last_activity: activity,
+                        message_count: count as usize,
+                        agent_alias,
+                        channel_id,
+                        room_id,
+                        sender_id,
+                        preview: None,
+                    })
+                },
+            )
+            .ok()?;
+        // Resolved after the row closure returns: the preview is a second
+        // lookup and cannot run while `query_row` holds the connection borrow.
+        meta.preview = first_user_message_preview_locked(&conn, session_key);
+        Some(meta)
     }
 
     fn set_session_state(
@@ -1231,6 +1306,7 @@ impl SessionBackend for SqliteSessionBackend {
                 channel_id,
                 room_id,
                 sender_id,
+                preview: None,
             })
         }) {
             Ok(r) => r,
@@ -1281,6 +1357,7 @@ impl SessionBackend for SqliteSessionBackend {
                 channel_id,
                 room_id,
                 sender_id,
+                preview: None,
             })
         }) {
             Ok(r) => r,
@@ -1352,6 +1429,7 @@ impl SessionBackend for SqliteSessionBackend {
                             channel_id,
                             room_id,
                             sender_id,
+                            preview: None,
                         })
                     },
                 )
@@ -1443,6 +1521,33 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, "user");
         assert_eq!(msgs[1].role, "assistant");
+    }
+
+    #[test]
+    fn attachments_round_trip_sqlite() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let attachment = AttachmentRef {
+            id: "abc123.pdf".to_string(),
+            filename: "report.pdf".to_string(),
+            title: "Quarterly report".to_string(),
+            mime: "application/pdf".to_string(),
+            size: 42,
+        };
+
+        backend.append("s", &ChatMessage::user("here")).unwrap();
+        backend
+            .append_with_attachments(
+                "s",
+                &ChatMessage::assistant("done"),
+                std::slice::from_ref(&attachment),
+            )
+            .unwrap();
+
+        let rows = backend.load_with_timestamps("s");
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].attachments.is_empty());
+        assert_eq!(rows[1].attachments, vec![attachment]);
     }
 
     #[test]
@@ -2467,6 +2572,87 @@ mod tests {
         assert!(meta[0].name.is_none());
     }
 
+    // ── preview tests ───────────────────────────────────────────────
+
+    #[test]
+    fn preview_comes_from_the_first_user_message_only() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        // An assistant greeting or a tool digest must not become the label, and
+        // the second user turn must not displace the first.
+        backend
+            .append("s1", &ChatMessage::assistant("Welcome!"))
+            .unwrap();
+        backend.append("s1", &ChatMessage::tool("result")).unwrap();
+        backend
+            .append("s1", &ChatMessage::user("планета айфон на Таганке"))
+            .unwrap();
+        backend
+            .append("s1", &ChatMessage::user("ещё один"))
+            .unwrap();
+
+        let meta = backend.list_sessions_with_metadata();
+        assert_eq!(meta[0].preview.as_deref(), Some("планета айфон на Таганке"));
+    }
+
+    #[test]
+    fn preview_skips_blank_user_rows() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("s1", &ChatMessage::user("   ")).unwrap();
+        backend
+            .append("s1", &ChatMessage::user("real question"))
+            .unwrap();
+
+        let meta = backend.list_sessions_with_metadata();
+        assert_eq!(meta[0].preview.as_deref(), Some("real question"));
+    }
+
+    #[test]
+    fn preview_absent_when_the_session_has_no_user_message() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("s1", &ChatMessage::assistant("hi")).unwrap();
+
+        let meta = backend.list_sessions_with_metadata();
+        assert!(meta[0].preview.is_none());
+    }
+
+    #[test]
+    fn preview_is_listed_for_every_session_in_one_pass() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("s1", &ChatMessage::user("first")).unwrap();
+        backend.append("s2", &ChatMessage::user("second")).unwrap();
+
+        let meta = backend.list_sessions_with_metadata();
+        let preview = |key: &str| {
+            meta.iter()
+                .find(|m| m.key == key)
+                .and_then(|m| m.preview.clone())
+        };
+        assert_eq!(preview("s1").as_deref(), Some("first"));
+        assert_eq!(preview("s2").as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn named_sessions_still_carry_a_preview_for_the_fallback_surface() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend.set_session_name("s1", "My Chat").unwrap();
+
+        // The gateway decides which one the UI sees; the backend reports both.
+        let meta = backend.list_sessions_with_metadata();
+        assert_eq!(meta[0].name.as_deref(), Some("My Chat"));
+        assert_eq!(meta[0].preview.as_deref(), Some("hello"));
+    }
+
     // ── session state tests ─────────────────────────────────────────
 
     #[test]
@@ -2806,5 +2992,9 @@ mod tests {
         assert_eq!(single.name, from_list.name);
         assert_eq!(single.created_at, from_list.created_at);
         assert_eq!(single.last_activity, from_list.last_activity);
+        // The single-row and list paths derive the label the same way, so a
+        // surface that re-fetches one session does not change its title.
+        assert_eq!(single.preview.as_deref(), Some("a"));
+        assert_eq!(single.preview, from_list.preview);
     }
 }

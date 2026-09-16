@@ -31,10 +31,12 @@ Object.assign(globalThis, { localStorage: storage });
 const {
   STORAGE_KEY,
   applySessionChange,
+  initialWorkspaceState,
   loadPersisted,
   makeTab,
   reservationsByKey,
   tabForOpenRequest,
+  tabForSessionRequest,
   withDistinctSessions,
 } = await import('./chatWorkspace.state.ts');
 
@@ -180,6 +182,75 @@ test('opening a different agent resumes that alias, it does not fork a conversat
   const coder = tabForOpenRequest([ops], 'coder');
 
   assert.equal(coder.sessionId, 'B');
+});
+
+// ─ Deep links ─────────────────────────────────────────────────────────────
+
+test('a deep link mints a pane onto exactly the named conversation', () => {
+  storage.setItem('zeroclaw_active_session.ops', 'A');
+  const existing = tabForOpenRequest([], 'ops');
+
+  const { tabs, activeKey } = tabForSessionRequest([existing], 'ops', 'TARGET');
+
+  assert.equal(tabs.length, 2);
+  // The pointer said 'A', but the link names 'TARGET' and must win.
+  assert.equal(tabs[1]?.sessionId, 'TARGET');
+  assert.equal(tabs[1]?.alias, 'ops');
+  assert.equal(activeKey, tabs[1]?.key);
+  assert.equal(tabs[0], existing);
+});
+
+test('a deep link to an already-shown conversation activates its pane instead of forking', () => {
+  const tabs: Tab[] = [
+    { key: 'k1', alias: 'ops', sessionId: 'A' },
+    { key: 'k2', alias: 'coder', sessionId: 'B' },
+  ];
+
+  const resolved = tabForSessionRequest(tabs, 'ops', 'B');
+
+  // 'B' is coder's, but a session is globally unique: a second pane on it would
+  // be the two-sockets-one-session hazard the exclusivity rule exists to stop.
+  assert.equal(resolved.tabs, tabs);
+  assert.equal(resolved.activeKey, 'k2');
+});
+
+test('a deep link with no owner touches no pane and mints one', () => {
+  const resolved = tabForSessionRequest([], 'ops', 'TARGET');
+
+  assert.equal(resolved.tabs.length, 1);
+  assert.equal(resolved.tabs[0]?.sessionId, 'TARGET');
+  assert.equal(resolved.activeKey, resolved.tabs[0]?.key);
+});
+
+test('a deep link landing on another agent still opens the route agent without forking', () => {
+  const persisted = {
+    tabs: [{ key: 'k1', alias: 'coder', sessionId: 'SHARED' }],
+    activeKey: 'k1',
+  };
+
+  const { tabs, activeKey } = initialWorkspaceState(persisted, 'ops', 'SHARED');
+
+  // The URL names `ops`, so that pane is opened — but `SHARED` belongs to
+  // coder, and the link wins the active slot rather than two panes sharing it.
+  assert.equal(tabs.length, 2);
+  assert.equal(activeKey, 'k1');
+  assert.equal((tabs.find((tb: Tab) => tb.key === activeKey) as Tab).sessionId, 'SHARED');
+  assert.equal(tabs.filter((tb: Tab) => tb.alias === 'ops').length, 1);
+  assert.equal(new Set(tabs.map((tb: Tab) => tb.sessionId)).size, 2);
+});
+
+test('a deep link keeps the linked pane on its conversation when the alias resumed it too', () => {
+  // The route agent's pointer names the same conversation the link does, so the
+  // alias pane added for the URL would otherwise land on the linked session.
+  storage.setItem('zeroclaw_active_session.ops', 'TARGET');
+
+  const { tabs, activeKey } = initialWorkspaceState({ tabs: [] }, 'ops', 'TARGET');
+
+  assert.equal(activeKey, tabs[0]?.key);
+  assert.equal(tabs[0]?.sessionId, 'TARGET');
+  // Either the pane count is one (the link's pane is the alias's) or the extra
+  // pane was moved off it; never two panes on `TARGET`.
+  assert.equal(new Set(tabs.map((tb: Tab) => tb.sessionId)).size, tabs.length);
 });
 
 // ── Reservations ───────────────────────────────────────────────────────────

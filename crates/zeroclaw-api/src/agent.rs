@@ -1,4 +1,24 @@
 use crate::plan::PlanEntry;
+use serde::{Deserialize, Serialize};
+
+/// Client-safe reference to a delivered file. Unlike [`ToolArtifact`] it never
+/// carries the host filesystem `path` — only the opaque content-addressed `id`,
+/// display metadata, and size. This is what travels to channel clients and is
+/// persisted in the session transcript.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentRef {
+    /// Opaque content-addressed id (the `attachment://deliver/<id>` suffix).
+    /// Resolves to `<workspace>/uploads/<id>`; carries no caller-supplied path.
+    pub id: String,
+    /// Original filename, for download.
+    pub filename: String,
+    /// Human-readable chat label; defaults to the filename.
+    pub title: String,
+    /// MIME type.
+    pub mime: String,
+    /// Size in bytes.
+    pub size: u64,
+}
 
 /// Structured metadata for a tool that produced a file artifact (e.g.
 /// `deliver_file`). Carried on [`TurnEvent::ToolResult`] so a channel attaches
@@ -51,6 +71,33 @@ impl ToolArtifact {
                 .unwrap_or(0),
             path,
         })
+    }
+
+    /// Project into the client-safe [`AttachmentRef`], dropping the host
+    /// `path`. The `id` is the opaque suffix of the `attachment://deliver/<id>`
+    /// citation URI; when the URI is absent it falls back to the basename of
+    /// `path`.
+    pub fn into_ref(&self) -> AttachmentRef {
+        let id = self
+            .uri
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                self.path
+                    .rsplit(['/', '\\'])
+                    .find(|s| !s.is_empty())
+                    .unwrap_or_default()
+                    .to_string()
+            });
+        AttachmentRef {
+            id,
+            filename: self.filename.clone(),
+            title: self.title.clone(),
+            mime: self.mime.clone(),
+            size: self.size,
+        }
     }
 }
 
@@ -183,5 +230,38 @@ mod tool_artifact_tests {
         assert!(
             ToolArtifact::from_delivered_data(&json!({"delivered": true, "path": ""})).is_none()
         );
+    }
+
+    #[test]
+    fn into_ref_drops_host_path_and_extracts_id_from_uri() {
+        let data = json!({
+            "delivered": true,
+            "uri": "attachment://deliver/abc123.pdf",
+            "path": "/secret/ws/uploads/abc123.pdf",
+            "filename": "report.pdf",
+            "title": "Quarterly report",
+            "mimeType": "application/pdf",
+            "bytes": 1234,
+        });
+        let a = ToolArtifact::from_delivered_data(&data).unwrap();
+        let r = a.into_ref();
+        assert_eq!(r.id, "abc123.pdf");
+        assert_eq!(r.filename, "report.pdf");
+        assert_eq!(r.title, "Quarterly report");
+        assert_eq!(r.mime, "application/pdf");
+        assert_eq!(r.size, 1234);
+    }
+
+    #[test]
+    fn into_ref_falls_back_to_path_basename_without_uri() {
+        let a = ToolArtifact {
+            path: "/ws/uploads/deadbeef.bin".to_string(),
+            uri: String::new(),
+            filename: "x.bin".to_string(),
+            title: "x.bin".to_string(),
+            mime: "application/octet-stream".to_string(),
+            size: 1,
+        };
+        assert_eq!(a.into_ref().id, "deadbeef.bin");
     }
 }

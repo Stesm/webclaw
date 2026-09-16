@@ -6313,6 +6313,39 @@ pub struct PacingConfig {
     pub loop_detection_no_progress_min_calls: usize,
 }
 
+/// Default cap on message-timeout scaling. Shared by the channel runtime and
+/// the gateway so both transports give one message the same wall-clock budget.
+pub const DEFAULT_MESSAGE_TIMEOUT_SCALE_CAP: u64 = 4;
+
+/// Floor for a message's wall-clock budget. A misconfigured tiny timeout must
+/// not abort every turn before the model can answer.
+pub const MIN_MESSAGE_TIMEOUT_SECS: u64 = 30;
+
+/// Scale a base per-message timeout by the tool-loop depth, capped so a large
+/// `max_tool_iterations` cannot produce an unbounded wait. `0` iterations is
+/// treated as one step. This is the single formula every transport must use.
+pub fn scaled_message_timeout_budget_secs(
+    base_secs: u64,
+    max_tool_iterations: usize,
+    scale_cap: u64,
+) -> u64 {
+    base_secs.saturating_mul((max_tool_iterations.max(1) as u64).min(scale_cap))
+}
+
+impl PacingConfig {
+    /// Wall-clock budget for a single message turn, matching the channel
+    /// runtime: `base * min(max_tool_iterations, message_timeout_scale_max)`.
+    #[must_use]
+    pub fn message_timeout_budget_secs(&self, base_secs: u64, max_tool_iterations: usize) -> u64 {
+        scaled_message_timeout_budget_secs(
+            base_secs,
+            max_tool_iterations,
+            self.message_timeout_scale_max
+                .unwrap_or(DEFAULT_MESSAGE_TIMEOUT_SCALE_CAP),
+        )
+    }
+}
+
 fn default_loop_detection_enabled() -> bool {
     true
 }
@@ -30716,6 +30749,26 @@ runtime_profile = "long_turn"
         assert!(cfg.loop_detection_min_elapsed_secs.is_none());
         assert!(cfg.loop_ignore_tools.is_empty());
         assert!(cfg.message_timeout_scale_max.is_none());
+    }
+
+    #[test]
+    async fn message_timeout_budget_scales_and_caps() {
+        let default_cfg = PacingConfig::default();
+        // Zero iterations is treated as one step.
+        assert_eq!(default_cfg.message_timeout_budget_secs(300, 0), 300);
+        // Depth scales the budget up to the default cap.
+        assert_eq!(
+            default_cfg.message_timeout_budget_secs(300, 10),
+            300 * DEFAULT_MESSAGE_TIMEOUT_SCALE_CAP
+        );
+
+        let custom = PacingConfig {
+            message_timeout_scale_max: Some(8),
+            ..PacingConfig::default()
+        };
+        assert_eq!(custom.message_timeout_budget_secs(300, 10), 300 * 8);
+        assert_eq!(custom.message_timeout_budget_secs(300, 20), 300 * 8);
+        assert_eq!(custom.message_timeout_budget_secs(300, 1), 300);
     }
 
     #[test]

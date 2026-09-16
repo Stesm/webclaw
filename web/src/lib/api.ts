@@ -1356,6 +1356,27 @@ export function readAgentWorkspaceFile(
   );
 }
 
+/**
+ * Fetch the raw bytes of a delivered file attachment by its opaque
+ * content-addressed id. Uses an Authorization header (not a URL token) and
+ * returns a Blob the caller can turn into an object URL for preview or
+ * download.
+ */
+export async function fetchAgentAttachment(
+  alias: string,
+  id: string,
+): Promise<Blob> {
+  const token = getToken();
+  const url = `${apiOrigin}${basePath}/api/agents/${encodeURIComponent(alias)}/attachments/${encodeURIComponent(id)}`;
+  const headers = new Headers();
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  const res = await fetch(url, { headers });
+  if (!res.ok) {
+    throw new HttpError(res.status, await res.text().catch(() => ""));
+  }
+  return res.blob();
+}
+
 export function deleteAgentWorkspacePath(
   alias: string,
   path: string,

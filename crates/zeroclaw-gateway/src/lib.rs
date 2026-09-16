@@ -9,6 +9,7 @@ pub mod a2a;
 pub mod acp;
 pub mod agent_owned_state;
 pub mod api;
+pub mod api_attachments;
 pub mod api_browse;
 pub mod api_config;
 pub mod api_logs;
@@ -34,6 +35,7 @@ pub mod api_webhook;
 pub mod auth_rate_limit;
 pub mod canvas;
 pub mod hardware_context;
+pub mod live_turn;
 pub mod node_tool;
 pub mod nodes;
 pub mod openapi;
@@ -740,13 +742,11 @@ pub struct AppState {
     /// WebAuthn state for hardware key authentication (optional, requires `webauthn` feature)
     #[cfg(feature = "webauthn")]
     pub webauthn: Option<Arc<api_webauthn::WebAuthnState>>,
-    /// Per-session cancellation tokens for aborting in-flight agent responses.
-    /// Key is session_key (e.g. `gw_<session_id>`), value is the token for the
-    /// current turn. Entries are inserted before each turn and removed after
-    /// completion (normal or cancelled).
-    pub cancel_tokens: Arc<
-        std::sync::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
-    >,
+    /// Live in-flight turns, keyed by session_key (e.g. `gw_<session_id>`).
+    /// Holds the turn's cancellation token and a progress snapshot a
+    /// reconnecting socket reads. Entries are inserted before each turn and
+    /// removed on completion (normal, cancelled, errored, or timed out).
+    pub active_turns: crate::live_turn::ActiveTurns,
     pub pending_reload: Arc<std::sync::atomic::AtomicBool>,
     /// TUI session registry from the daemon (for /api/tuis endpoint).
     /// `None` when the gateway runs standalone without a daemon.
@@ -1822,7 +1822,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         path_prefix: path_prefix.unwrap_or("").to_string(),
         web_dist_dir,
         canvas_store,
-        cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        active_turns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         tui_registry,
         sop_engine,
@@ -2040,6 +2040,10 @@ pub async fn run_gateway_with_plugin_webhooks(
         .route(
             "/api/agents/{alias}/workspace/mkdir",
             post(api_browse::handle_agent_workspace_mkdir),
+        )
+        .route(
+            "/api/agents/{alias}/attachments/{id}",
+            get(api_attachments::handle_agent_attachment),
         )
         .route(
             "/api/agents/{alias}/skills",
@@ -4787,7 +4791,7 @@ mod tests {
             device_registry: registry,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            active_turns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -5775,7 +5779,7 @@ path = "{trigger_path}"
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            active_turns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -5861,7 +5865,7 @@ path = "{trigger_path}"
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            active_turns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -6534,7 +6538,7 @@ path = "{trigger_path}"
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            active_turns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -7444,7 +7448,7 @@ path = "{trigger_path}"
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            active_turns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -7564,7 +7568,7 @@ path = "{trigger_path}"
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            active_turns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -7663,7 +7667,7 @@ path = "{trigger_path}"
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            active_turns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -7868,7 +7872,7 @@ path = "{trigger_path}"
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            active_turns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -7954,7 +7958,7 @@ path = "{trigger_path}"
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            active_turns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -8045,7 +8049,7 @@ path = "{trigger_path}"
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            active_turns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -8141,7 +8145,7 @@ path = "{trigger_path}"
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            active_turns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -8233,7 +8237,7 @@ path = "{trigger_path}"
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            active_turns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -8333,7 +8337,7 @@ path = "{trigger_path}"
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            active_turns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -8484,7 +8488,7 @@ path = "{trigger_path}"
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            active_turns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             sop_engine: None,
             sop_audit: None,
             #[cfg(feature = "webauthn")]
@@ -9366,7 +9370,7 @@ path = "{trigger_path}"
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            active_turns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -9451,7 +9455,7 @@ path = "{trigger_path}"
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            active_turns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -10062,7 +10066,7 @@ path = "{trigger_path}"
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            active_turns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,

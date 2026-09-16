@@ -1574,6 +1574,11 @@ struct StreamChunkResponse {
     /// `stream_options.include_usage: true` and the provider supports it.
     #[serde(default)]
     usage: Option<UsageInfo>,
+    /// In-band error object. OpenAI-compatible routers (Polza, ZeroRouter)
+    /// may emit `data: {"error": {...}}` with HTTP 200 instead of a failure
+    /// status code, so it must be captured before serde drops unknown fields.
+    #[serde(default)]
+    error: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2066,6 +2071,31 @@ fn sse_bytes_to_events_for_contract(
                                 return;
                             }
                         };
+
+                        if let Some(error) = chunk.error.as_ref().filter(|error| !error.is_null()) {
+                            let message = match error {
+                                serde_json::Value::String(message) => message.clone(),
+                                _ => structured_api_error_message(error)
+                                    .unwrap_or_else(|| error.to_string()),
+                            };
+                            let sanitized = super::sanitize_api_error(&message);
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Fail
+                                )
+                                .with_category(::zeroclaw_log::EventCategory::Provider)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                                "compatible provider reported in-stream error over HTTP 200"
+                            );
+                            let _ = tx
+                                .send(Err(StreamError::ModelProvider(format!(
+                                    "provider stream error: {sanitized}"
+                                ))))
+                                .await;
+                            return;
+                        }
 
                         let mut should_emit_tool_calls = false;
                         for choice in &chunk.choices {
@@ -5448,6 +5478,27 @@ mod tests {
             matches!(events.last(), Some(Ok(StreamEvent::Final))),
             "got: {events:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn in_stream_error_object_over_http_200_surfaces_provider_error() {
+        let events = collect_stream_events(
+            "data: {\"error\":{\"message\":\"insufficient credits\"}}\n\ndata: [DONE]\n\n",
+        )
+        .await;
+        let Some(Err(StreamError::ModelProvider(message))) = events.first() else {
+            panic!("expected in-stream provider error, got: {events:?}");
+        };
+        assert_eq!(message, "provider stream error: insufficient credits");
+    }
+
+    #[tokio::test]
+    async fn in_stream_error_without_message_surfaces_sanitized_payload() {
+        let events = collect_stream_events("data: {\"error\":\"quota exceeded\"}\n\n").await;
+        let Some(Err(StreamError::ModelProvider(message))) = events.first() else {
+            panic!("expected in-stream provider error, got: {events:?}");
+        };
+        assert_eq!(message, "provider stream error: quota exceeded");
     }
 
     #[tokio::test]

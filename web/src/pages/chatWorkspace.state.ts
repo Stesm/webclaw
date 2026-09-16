@@ -147,6 +147,69 @@ export function tabForOpenRequest(tabs: ChatTab[], alias: string): ChatTab {
   return makeTab(alias, alreadyOpen ? newSessionId() : undefined);
 }
 
+/**
+ * Resolve a deep link that names a conversation.
+ *
+ * A pane already showing it is activated instead of forked — including a pane
+ * of another agent, since a session id is globally unique and the exclusivity
+ * rule (see `reservationsByKey`) forbids two panes owning it. Only when nothing
+ * owns the conversation is a pane minted onto it.
+ */
+export function tabForSessionRequest(
+  tabs: ChatTab[],
+  alias: string,
+  sessionId: string,
+): { tabs: ChatTab[]; activeKey: string } {
+  const owner = tabs.find((tb) => tb.sessionId === sessionId);
+  if (owner) return { tabs, activeKey: owner.key };
+  const tab = makeTab(alias, sessionId);
+  return { tabs: [...tabs, tab], activeKey: tab.key };
+}
+
+/**
+ * First-commit shape of the workspace.
+ *
+ * Without a `?session=` request this is the restored layout with the route
+ * alias present and its stored pane (or the alias's first one) selected.
+ *
+ * With one, the named conversation is authoritative: its pane is selected even
+ * when it belongs to another agent, the requested session's owner is not
+ * forked, and the route alias is still opened when the link did not already
+ * land on one of its panes — the URL says `/agent/<alias>`, so that agent must
+ * be open, just not necessarily in front.
+ */
+export function initialWorkspaceState(
+  persisted: Partial<PersistedState>,
+  initialAlias: string,
+  initialSessionId?: string,
+): { tabs: ChatTab[]; activeKey: string } {
+  const restored = persisted.tabs ?? [];
+
+  if (initialSessionId) {
+    const resolved = tabForSessionRequest(restored, initialAlias, initialSessionId);
+    const tabs = resolved.tabs.some((tb) => tb.alias === initialAlias)
+      ? resolved.tabs
+      : [...resolved.tabs, makeTab(initialAlias)];
+    // The added alias pane resumed a pointer that could name the linked
+    // conversation; the same repair the restore path uses keeps the two panes
+    // from claiming one gateway session.
+    return { tabs: withDistinctSessions(tabs), activeKey: resolved.activeKey };
+  }
+
+  // The route's agent is always open, but only add it when it is not already
+  // there — a deep link should land on the existing pane, not fork a new one.
+  const tabs = restored.some((tb) => tb.alias === initialAlias)
+    ? restored
+    : [...restored, makeTab(initialAlias)];
+  // Prefer the pane that was active when the workspace was stored, so reloading
+  // with two panes of one agent returns to the right one.
+  const preferred = persisted.activeKey;
+  const match =
+    tabs.find((tb) => tb.key === preferred && tb.alias === initialAlias) ??
+    tabs.find((tb) => tb.alias === initialAlias);
+  return { tabs, activeKey: match?.key ?? tabs[0]?.key ?? '' };
+}
+
 /** Record the conversation a pane moved to, so a reload restores it there. */
 export function applySessionChange(
   tabs: ChatTab[],

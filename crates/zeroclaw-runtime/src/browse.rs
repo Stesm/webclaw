@@ -159,6 +159,11 @@ pub fn remove_directory(config: &Config, raw: &str) -> Result<(), BrowseError> {
 /// `BrowseError::TooLarge`; the dashboard can offer a CLI hint.
 pub const AGENT_WORKSPACE_READ_CAP: u64 = 4 * 1024 * 1024; // 4 MiB
 
+/// Byte cap for reading delivered attachment bytes for download/preview.
+/// Matches `deliver_file`'s own delivery cap so every file the agent can
+/// deliver is also retrievable; the browse preview cap above is stricter.
+pub const AGENT_ATTACHMENT_READ_CAP: u64 = 10 * 1024 * 1024; // 10 MiB
+
 const AGENT_WORKSPACE_PROTECTED_FILES: &[&str] = &[
     "IDENTITY.md",
     "SOUL.md",
@@ -253,6 +258,17 @@ pub fn read_agent_workspace_file(
     agent_alias: &str,
     raw: &str,
 ) -> Result<FileReadResult, BrowseError> {
+    read_agent_workspace_file_capped(config, agent_alias, raw, AGENT_WORKSPACE_READ_CAP)
+}
+
+/// Same as [`read_agent_workspace_file`] but with an explicit byte cap, for
+/// callers that serve larger delivered attachments.
+pub fn read_agent_workspace_file_capped(
+    config: &Config,
+    agent_alias: &str,
+    raw: &str,
+    max_bytes: u64,
+) -> Result<FileReadResult, BrowseError> {
     let root = agent_root(config, agent_alias);
     let resolved: PathBuf = resolve_under(&root, raw)?;
     let metadata = match std::fs::metadata(&resolved) {
@@ -265,11 +281,8 @@ pub fn read_agent_workspace_file(
     if !metadata.is_file() {
         return Err(BrowseError::NotADirectory(raw.to_string()));
     }
-    if metadata.len() > AGENT_WORKSPACE_READ_CAP {
-        return Err(BrowseError::TooLarge(
-            raw.to_string(),
-            AGENT_WORKSPACE_READ_CAP,
-        ));
+    if metadata.len() > max_bytes {
+        return Err(BrowseError::TooLarge(raw.to_string(), max_bytes));
     }
     let bytes = std::fs::read(&resolved)?;
     let is_text = std::str::from_utf8(&bytes).is_ok();

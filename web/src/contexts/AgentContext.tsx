@@ -3,6 +3,8 @@ import type {
   ApprovalDecision,
   PendingApproval,
   SessionMessagesResponse,
+  TurnProgress,
+  WsAttachment,
   WsMessage,
 } from '@/types/api';
 import { WebSocketClient } from '@/lib/ws';
@@ -40,6 +42,7 @@ import {
   saveChatHistory,
   uiMessagesToPersisted,
 } from '@/lib/chatHistoryStorage';
+import { usePolling } from '@/hooks/usePolling';
 
 export interface ChatMessage {
   id: string;
@@ -48,6 +51,8 @@ export interface ChatMessage {
   thinking?: string;
   markdown?: boolean;
   toolCall?: ToolCallInfo;
+  /** File attachments delivered during the turn, rendered under the bubble. */
+  attachments?: WsAttachment[];
   timestamp: Date;
   /** True for messages composed locally in the web UI (verbatim user input).
    *  Such content never carries the gateway's `[timestamp]` prefix, so the
@@ -124,6 +129,12 @@ export interface AgentContextValue {
   // Context window tracking (from "done" WS frames). See #7311.
   contextMaxTokens: number | null;
   contextInputTokens: number | null;
+  /**
+   * Live snapshot of a running turn another connection owns, polled while this
+   * pane is a viewer. Null when no background turn is running. Rendered in
+   * place of the local stream so a reopened tab shows real progress.
+   */
+  liveProgress: TurnProgress | null;
 }
 
 const AgentContext = createContext<AgentContextValue | null>(null);
@@ -262,6 +273,10 @@ export function AgentProvider({
   const modelSwitchSocketRef = useRef<SessionSocket | null>(null);
   const switchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsVersionRef = useRef(0);
+  // Whether the current socket has already opened once. Distinguishes a
+  // transparent WebSocketClient reconnect (refresh the transcript) from the
+  // first open after mount/session switch (hydration already covers it).
+  const wsOpenedRef = useRef(false);
   // Socket generation that delivered the live `approval_request`, or null.
   // A parked approval dies with the socket that carried it (the gateway
   // auto-denies the request_id when that socket closes), so only that socket's
@@ -269,6 +284,19 @@ export function AgentProvider({
   // newer socket owns. See the onClose handler in attachSocketCallbacks.
   const approvalSocketVersionRef = useRef<number | null>(null);
   const localMessageMutationVersionRef = useRef(0);
+  // True while this pane is a viewer of a turn another connection owns (a
+  // background turn that survived a tab close). The composer stays disabled and
+  // the socket is only watching for `turn_done`; the visible reply arrives via
+  // a forced transcript refresh, not a local stream.
+  const backgroundTurnRef = useRef(false);
+  // Render-facing mirror of `backgroundTurnRef` (a ref cannot trigger render)
+  // plus the live-turn progress snapshot polled from the gateway while this
+  // pane only watches a turn another connection owns.
+  const [backgroundTurn, setBackgroundTurn] = useState(false);
+  const [liveProgress, setLiveProgress] = useState<TurnProgress | null>(null);
+  // Attachments delivered during the in-flight turn, collected from
+  // `tool_result` frames and attached to the turn's committed agent message.
+  const pendingAttachmentsRef = useRef<WsAttachment[]>([]);
   // Rebuild callbacks intentionally retain the dependency shape already on
   // master. These mirrors still make their async work use the latest session
   // and injected runtime after a conversation switch.
@@ -286,6 +314,27 @@ export function AgentProvider({
   useEffect(() => {
     void primeModelProviderCatalog();
   }, []);
+
+  // While this pane only watches a turn another connection owns, poll the
+  // session's live progress snapshot so the reopened tab shows the running
+  // tools/text instead of a bare spinner. Stops the moment viewer state ends
+  // or the turn's terminal frame arrives.
+  usePolling(
+    async (isStale) => {
+      const sid = activeSessionIdRef.current;
+      if (!sid) return;
+      try {
+        const res = await sessionRuntimeRef.current.getMessages(sid);
+        if (isStale() || !backgroundTurnRef.current) return;
+        setLiveProgress(res.in_progress ?? null);
+      } catch {
+        // Transient fetch failure: keep the last snapshot until the next tick.
+      }
+    },
+    2000,
+    [backgroundTurn, sessionId],
+    backgroundTurn,
+  );
 
   // Hydrate chat from server (preferred) or localStorage fallback. Re-runs on
   // every session switch, which is what rehydrates the transcript of the
@@ -368,10 +417,46 @@ export function AgentProvider({
     return result;
   }, []);
 
+  // Re-pull the persisted transcript of the active conversation. Used when a
+  // background turn (survivor of a socket close) finishes: its `done` frame
+  // went to a dead socket, so the live client must hydrate the response it
+  // never streamed. Fenced against a typing turn and racing local mutations so
+  // it can never clobber live stream state.
+  const refreshTranscript = useCallback(async (force = false) => {
+    const sid = activeSessionIdRef.current;
+    if (!sid) return;
+    const versionAtStart = localMessageMutationVersionRef.current;
+    try {
+      const res = await sessionRuntimeRef.current.getMessages(sid);
+      setSessionPersistence(res.session_persistence);
+      if (
+        res.session_persistence
+        && localMessageMutationVersionRef.current === versionAtStart
+        && (force || !typingRef.current)
+      ) {
+        setMessages(persistedToUiMessages(mapServerMessagesToPersisted(res.messages)));
+      }
+    } catch {
+      return;
+    }
+  }, []);
+
   // Centralised WebSocket message handler — reused across initial connect and reconnects.
   const handleWsMessage = useCallback((msg: WsMessage) => {
     switch (msg.type) {
       case 'session_start':
+        // The gateway reports whether another connection owns an in-flight turn
+        // for this session (a background turn that survived a tab close). If so
+        // this pane is a viewer: disable the composer, show the turn's live
+        // progress snapshot, and wait for `turn_done`.
+        if (msg.running) {
+          backgroundTurnRef.current = true;
+          setBackgroundTurn(true);
+          setTyping(true);
+          setLiveProgress(msg.progress ?? null);
+        }
+        break;
+
       case 'connected':
         break;
 
@@ -404,9 +489,12 @@ export function AgentProvider({
           full_response: msg.full_response,
           content: msg.content,
         });
+        const delivered = pendingAttachmentsRef.current;
+        const attachments = delivered.length > 0 ? delivered : undefined;
         if (outcome?.kind === 'commit') {
           // `commit` includes reasoning-only turns: empty content but present
           // thinking, so the turn renders instead of vanishing silently.
+          pendingAttachmentsRef.current = [];
           localMessageMutationVersionRef.current += 1;
           setMessages((prev) => [
             ...prev,
@@ -416,6 +504,7 @@ export function AgentProvider({
               content: outcome.content,
               thinking: outcome.thinking,
               markdown: true,
+              attachments,
               timestamp: new Date(),
             },
           ]);
@@ -423,6 +512,7 @@ export function AgentProvider({
           // Clean completion with nothing at all — surface a one-off notice so
           // the turn does not disappear. Mirrors zerocode's zc-turn-no-output
           // fallback (#8779). `skip` (empty + tool calls ran) renders nothing.
+          pendingAttachmentsRef.current = [];
           localMessageMutationVersionRef.current += 1;
           setMessages((prev) => [
             ...prev,
@@ -430,8 +520,24 @@ export function AgentProvider({
               id: generateUUID(),
               role: 'agent',
               content: t('agent.turn_no_output'),
+              attachments,
               timestamp: new Date(),
               ephemeral: true,
+            },
+          ]);
+        } else if (attachments) {
+          // A turn whose only visible output is a delivered file still needs a
+          // bubble to host the attachment card.
+          pendingAttachmentsRef.current = [];
+          localMessageMutationVersionRef.current += 1;
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: generateUUID(),
+              role: 'agent',
+              content: '',
+              attachments,
+              timestamp: new Date(),
             },
           ]);
         }
@@ -451,6 +557,9 @@ export function AgentProvider({
         setStreamingContent('');
         setStreamingThinking('');
         setTyping(false);
+        backgroundTurnRef.current = false;
+        setBackgroundTurn(false);
+        setLiveProgress(null);
         break;
       }
 
@@ -507,6 +616,12 @@ export function AgentProvider({
         }
         const toolName = msg.name;
         const resultId = msg.id;
+        if (
+          msg.attachment
+          && !pendingAttachmentsRef.current.some((a) => a.id === msg.attachment!.id)
+        ) {
+          pendingAttachmentsRef.current = [...pendingAttachmentsRef.current, msg.attachment];
+        }
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => {
           // Correlate the result to its pending card by gateway tool_call_id so
@@ -630,9 +745,46 @@ export function AgentProvider({
         setStreamingContent('');
         setStreamingThinking('');
         setTyping(false);
+        backgroundTurnRef.current = false;
+        setBackgroundTurn(false);
+        setLiveProgress(null);
         setPendingApproval(null);
+        pendingAttachmentsRef.current = [];
         break;
       }
+
+      case 'turn_done': {
+        // A turn for this session reached a terminal state on the server.
+        if (msg.session_id !== activeSessionIdRef.current) {
+          break;
+        }
+        if (backgroundTurnRef.current) {
+          // This pane was only watching a background turn. Leave viewer state
+          // and force-pull the persisted reply, bypassing the typing guard that
+          // refreshTranscript uses against clobbering a live local stream.
+          backgroundTurnRef.current = false;
+          setBackgroundTurn(false);
+          setLiveProgress(null);
+          foldTurnStream({ type: 'reset' });
+          setStreamingContent('');
+          setStreamingThinking('');
+          setTyping(false);
+          void refreshTranscript(true);
+        } else if (!typingRef.current) {
+          // Not the socket that streamed it (typical: the turn survived a
+          // tab/pane switch, its frames went nowhere), so rehydrate.
+          void refreshTranscript();
+        }
+        break;
+      }
+
+      case 'turn_in_progress':
+        // Sent when we tried to run a turn another connection already owns.
+        // Watch instead of queueing behind it.
+        backgroundTurnRef.current = true;
+        setBackgroundTurn(true);
+        setTyping(true);
+        break;
 
       case 'error':
         const friendlyMessage = friendlyAgentError(msg.message);
@@ -656,9 +808,12 @@ export function AgentProvider({
         setStreamingContent('');
         setStreamingThinking('');
         setPendingApproval(null);
+        backgroundTurnRef.current = false;
+        setBackgroundTurn(false);
+        setLiveProgress(null);
         break;
     }
-  }, [foldTurnStream]);
+  }, [foldTurnStream, refreshTranscript]);
 
   // Wire up a WebSocketClient instance with version-guarded callbacks.
   const attachSocketCallbacks = useCallback((ws: SessionSocket) => {
@@ -666,8 +821,17 @@ export function AgentProvider({
 
     ws.onOpen = () => {
       if (version !== wsVersionRef.current) return;
+      const isReconnect = wsOpenedRef.current;
+      wsOpenedRef.current = true;
       setConnected(true);
       setError(null);
+
+      // A reconnect can miss a `turn_done` broadcast from a background turn
+      // that finished while this socket was down: pull the persisted
+      // transcript. A first open is already covered by the hydration effect.
+      if (isReconnect) {
+        void refreshTranscript();
+      }
 
       // If we just reconnected after a committed model switch, apply the
       // pending model now. A session socket can open while the config write is
@@ -768,6 +932,7 @@ export function AgentProvider({
       modelSwitchSocketRef.current = ws;
     }
     attachSocketCallbacks(ws);
+    wsOpenedRef.current = false;
     ws.connect();
     wsRef.current = ws as WebSocketClient;
 
@@ -867,6 +1032,10 @@ export function AgentProvider({
 
       setTyping(true);
       foldTurnStream({ type: 'turn_start' });
+      backgroundTurnRef.current = false;
+      setBackgroundTurn(false);
+      setLiveProgress(null);
+      pendingAttachmentsRef.current = [];
       localMessageMutationVersionRef.current += 1;
       setMessages((prev) => [
         ...prev,
@@ -1027,6 +1196,10 @@ export function AgentProvider({
     setStreamingThinking('');
     setTyping(false);
     setPendingApproval(null);
+    // A background-turn viewer state belongs to the outgoing conversation.
+    backgroundTurnRef.current = false;
+    setBackgroundTurn(false);
+    setLiveProgress(null);
     // Context-window figures describe the transcript we just dropped; leaving
     // them would show the outgoing conversation's token usage against an empty
     // one until the next `done` frame refreshes them.
@@ -1259,6 +1432,7 @@ export function AgentProvider({
     // Context window tracking (from "done" WS frames). See #7311.
     contextMaxTokens,
     contextInputTokens,
+    liveProgress,
   };
 
   return <AgentContext.Provider value={value}>{children}</AgentContext.Provider>;

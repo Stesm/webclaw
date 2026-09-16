@@ -1433,7 +1433,7 @@ mod tests {
             canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
-            cancel_tokens: std::sync::Arc::new(std::sync::Mutex::new(
+            active_turns: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
             pending_reload: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

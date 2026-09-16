@@ -178,6 +178,9 @@ export interface Session {
   last_activity: string;
   message_count: number;
   name?: string;
+  /** One-line excerpt of the first user message, for sessions the operator has
+   * not named. Derived by the gateway; absent whenever `name` is set. */
+  preview?: string;
   /** Alias of the agent that owned this session. `null` for legacy rows
    * with no attribution at all (channel_id null too). */
   agent_alias: string | null;
@@ -222,6 +225,15 @@ export interface SSEEvent {
   [key: string]: any;
 }
 
+export interface WsAttachment {
+  /** Opaque content-addressed id; resolves to GET /api/agents/{alias}/attachments/{id}. */
+  id: string;
+  filename: string;
+  title: string;
+  mime: string;
+  size: number;
+}
+
 export interface WsMessage {
   type:
     | "message"
@@ -238,17 +250,26 @@ export interface WsMessage {
     | "approval_request"
     | "history_trimmed"
     | "safeguard_fallback"
-    | "aborted";
+    | "aborted"
+    | "turn_done"
+    | "turn_in_progress";
   content?: string;
   full_response?: string;
   name?: string;
   args?: any;
   output?: string;
   id?: string;
+  /** File attachment carried on a `tool_result` frame from a file-producing tool. */
+  attachment?: WsAttachment;
   message?: string;
   code?: string;
   session_id?: string;
   resumed?: boolean;
+  /** Present on `session_start`: another connection owns an in-flight turn. */
+  running?: boolean;
+  /** Present on `session_start` when `running`: the live turn's progress. */
+  progress?: TurnProgress | null;
+  status?: string;
   message_count?: number;
   timestamp?: string;
   job_id?: string;
@@ -294,12 +315,37 @@ export interface SessionMessageRow {
   /** RFC 3339 timestamp recorded when the row was persisted. `null` for
    * backends that don't stamp per-row timestamps (JSONL / in-memory). */
   created_at: string | null;
+  /** Delivered file attachments recorded with this row, when the backend persists them. */
+  attachments?: WsAttachment[];
+}
+
+/** A tool invocation accumulated during a running gateway turn. */
+export interface TurnProgressTool {
+  id: string;
+  name: string;
+  args?: unknown;
+  /** Absent until the tool returns. */
+  output?: string | null;
+}
+
+/**
+ * In-memory mirror of a session's running turn. Present on
+ * `GET /api/sessions/{id}/messages` and `session_start` only while another
+ * connection owns an in-flight turn, so a reopened tab can render the tools
+ * and partial text live instead of showing an opaque spinner.
+ */
+export interface TurnProgress {
+  text: string;
+  thinking: string;
+  tool_calls: TurnProgressTool[];
 }
 
 export interface SessionMessagesResponse {
   session_id: string;
   messages: SessionMessageRow[];
   session_persistence: boolean;
+  /** Running-turn snapshot, or null/absent when no turn is live. */
+  in_progress?: TurnProgress | null;
 }
 
 export interface TuiEntry {

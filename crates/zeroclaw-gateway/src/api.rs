@@ -1743,6 +1743,11 @@ pub async fn handle_api_sessions_list(
             });
             if let Some(name) = meta.name {
                 entry["name"] = serde_json::Value::String(name);
+            } else if let Some(preview) = meta.preview {
+                // Only for unnamed sessions: a name is the operator's own label
+                // and outranks a derived excerpt, so sending both would invite
+                // the UI to disagree about which one wins.
+                entry["preview"] = serde_json::Value::String(preview);
             }
             entry
         })
@@ -1811,14 +1816,27 @@ pub async fn handle_api_session_messages(
                 "role": m.message.role,
                 "content": m.message.content,
                 "created_at": m.created_at.map(|dt| dt.to_rfc3339()),
+                "attachments": m.attachments,
             })
         })
         .collect();
+
+    // A turn another connection owns is not yet in the durable transcript, so
+    // a polling viewer reads its in-memory progress mirror to render the tools
+    // and partial text live.
+    let in_progress = state
+        .active_turns
+        .lock()
+        .expect("active_turns lock poisoned")
+        .get(&session_key)
+        .map(|turn| turn.progress())
+        .and_then(|progress| serde_json::to_value(progress).ok());
 
     Json(serde_json::json!({
         "session_id": id,
         "messages": messages,
         "session_persistence": true,
+        "in_progress": in_progress,
     }))
     .into_response()
 }
@@ -1933,10 +1951,11 @@ pub async fn handle_api_session_delete(
     let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
 
     let token = state
-        .cancel_tokens
+        .active_turns
         .lock()
-        .expect("cancel_tokens lock poisoned")
-        .remove(&session_key);
+        .expect("active_turns lock poisoned")
+        .remove(&session_key)
+        .map(|turn| turn.token());
     if let Some(token) = token {
         token.cancel();
         ::zeroclaw_log::record!(
@@ -2103,14 +2122,14 @@ pub async fn handle_api_session_abort(
     }
 
     // Resolve + look up under one lock so underscore-bearing display ids
-    // (e.g. `team_alpha`) match the live `gw_{id}` cancel-token key.
+    // (e.g. `team_alpha`) match the live `gw_{id}` active-turn key.
     let (session_key, token) = {
-        let tokens = state
-            .cancel_tokens
+        let turns = state
+            .active_turns
             .lock()
-            .expect("cancel_tokens lock poisoned");
-        let session_key = resolve_gateway_session_key(&id, |key| tokens.contains_key(key));
-        let token = tokens.get(&session_key).cloned();
+            .expect("active_turns lock poisoned");
+        let session_key = resolve_gateway_session_key(&id, |key| turns.contains_key(key));
+        let token = turns.get(&session_key).map(|turn| turn.token());
         (session_key, token)
     };
 
@@ -2384,7 +2403,7 @@ pub(crate) mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            active_turns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             reload_tx: None,
@@ -3641,10 +3660,13 @@ pub(crate) mod tests {
         let session_key = "gw_operator-1".to_string();
         let token = tokio_util::sync::CancellationToken::new();
         state
-            .cancel_tokens
+            .active_turns
             .lock()
-            .expect("cancel_tokens lock")
-            .insert(session_key.clone(), token.clone());
+            .expect("active_turns lock")
+            .insert(
+                session_key.clone(),
+                std::sync::Arc::new(crate::live_turn::ActiveTurn::new("t".into(), token.clone())),
+            );
 
         // Same id GET /api/sessions advertises as session_key for abort.
         let response = handle_api_session_abort(State(state), HeaderMap::new(), Path(session_key))
@@ -3665,10 +3687,13 @@ pub(crate) mod tests {
         let state = test_state(zeroclaw_config::schema::Config::default());
         let token = tokio_util::sync::CancellationToken::new();
         state
-            .cancel_tokens
+            .active_turns
             .lock()
-            .expect("cancel_tokens lock")
-            .insert("gw_operator-1".to_string(), token.clone());
+            .expect("active_turns lock")
+            .insert(
+                "gw_operator-1".to_string(),
+                std::sync::Arc::new(crate::live_turn::ActiveTurn::new("t".into(), token.clone())),
+            );
 
         let response = handle_api_session_abort(
             State(state),
@@ -3689,10 +3714,13 @@ pub(crate) mod tests {
         let state = test_state(zeroclaw_config::schema::Config::default());
         let token = tokio_util::sync::CancellationToken::new();
         state
-            .cancel_tokens
+            .active_turns
             .lock()
-            .expect("cancel_tokens lock")
-            .insert("gw_team_alpha".to_string(), token.clone());
+            .expect("active_turns lock")
+            .insert(
+                "gw_team_alpha".to_string(),
+                std::sync::Arc::new(crate::live_turn::ActiveTurn::new("t".into(), token.clone())),
+            );
 
         // List contract: session_id=team_alpha, session_key=gw_team_alpha.
         // Treating "_" as "already a full key" would miss this cancel token.
@@ -3849,6 +3877,58 @@ pub(crate) mod tests {
             backend.list_sessions().iter().any(|k| k == "gw_operator-1"),
             "rename must target the real session key, not a doubled gw_ prefix"
         );
+    }
+
+    #[tokio::test]
+    async fn sessions_list_labels_unnamed_sessions_with_a_preview_and_named_ones_without() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        // Preview derivation reads the message rows, so the SQLite backend is
+        // required here (SessionStore keeps no metadata table).
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_unnamed",
+                &zeroclaw_providers::ChatMessage::user("планета айфон на Таганке"),
+            )
+            .unwrap();
+        backend
+            .set_session_agent_alias("gw_unnamed", "coder")
+            .unwrap();
+        backend
+            .append("gw_named", &zeroclaw_providers::ChatMessage::user("hi"))
+            .unwrap();
+        backend
+            .set_session_agent_alias("gw_named", "coder")
+            .unwrap();
+        backend.set_session_name("gw_named", "Desk ops").unwrap();
+        let state = test_state_with_session_backend(config, backend);
+
+        let response = handle_api_sessions_list(State(state), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        let sessions = json["sessions"].as_array().expect("sessions array");
+        let row = |id: &str| {
+            sessions
+                .iter()
+                .find(|s| s["session_id"] == id)
+                .unwrap_or_else(|| panic!("missing session {id}"))
+        };
+
+        assert_eq!(row("unnamed")["preview"], "планета айфон на Таганке");
+        assert!(row("unnamed").get("name").is_none());
+        // A name outranks the derived label, so the preview is withheld rather
+        // than sent alongside — the UI must not have to decide which wins.
+        assert_eq!(row("named")["name"], "Desk ops");
+        assert!(row("named").get("preview").is_none());
     }
 
     #[tokio::test]

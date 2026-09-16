@@ -99,11 +99,13 @@ pub struct ScopedAssembly<'a> {
     pub connect_peripherals: bool,
     /// Documented divergence: ACP excludes persistent memory tools.
     pub exclude_memory: bool,
-    /// `deliver_file` hands the client a typed file attachment that only an
-    /// ACP-capable turn actually transports (the model history, WS, and RPC
-    /// paths all drop the artifact). Every non-ACP assembly passes `false` so
-    /// the tool is absent rather than returning a false success on a channel
-    /// that cannot deliver it. Only the ACP turn path passes `true`.
+    /// `deliver_file` hands the client a typed file attachment that only a
+    /// delivery-capable turn actually transports. ACP turns and the gateway
+    /// web WebSocket turn do (the latter frames it on `tool_result` and
+    /// persists it on the session message); the one-shot CLI, model-history,
+    /// and RPC paths drop the artifact. Every non-delivery assembly passes
+    /// `false` so the tool is absent rather than returning a false success on
+    /// a channel that cannot deliver it.
     pub acp_delivery: bool,
     pub list_deferred_mcp_specs: bool,
     pub emit_assembly_logs: bool,

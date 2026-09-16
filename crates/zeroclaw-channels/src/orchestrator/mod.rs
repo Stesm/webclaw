@@ -255,11 +255,13 @@ pub use zeroclaw_runtime::agent::system_prompt::{
 
 const DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS: u64 = 2;
 const DEFAULT_CHANNEL_MAX_BACKOFF_SECS: u64 = 60;
-const MIN_CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 30;
+const MIN_CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = zeroclaw_config::schema::MIN_MESSAGE_TIMEOUT_SECS;
 #[cfg(test)]
 const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 300;
 /// Cap timeout scaling so large max_tool_iterations values do not create unbounded waits.
-const CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP: u64 = 4;
+#[cfg(test)]
+const CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP: u64 =
+    zeroclaw_config::schema::DEFAULT_MESSAGE_TIMEOUT_SCALE_CAP;
 const CHANNEL_MIN_IN_FLIGHT_MESSAGES: usize = 8;
 const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
 const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
@@ -308,14 +310,17 @@ fn channel_message_timeout_budget_secs(
     )
 }
 
+#[cfg(test)]
 fn channel_message_timeout_budget_secs_with_cap(
     message_timeout_secs: u64,
     max_tool_iterations: usize,
     scale_cap: u64,
 ) -> u64 {
-    let iterations = max_tool_iterations.max(1) as u64;
-    let scale = iterations.min(scale_cap);
-    message_timeout_secs.saturating_mul(scale)
+    zeroclaw_config::schema::scaled_message_timeout_budget_secs(
+        message_timeout_secs,
+        max_tool_iterations,
+        scale_cap,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8236,15 +8241,9 @@ async fn process_channel_message_body(
         Cancelled,
     }
 
-    let scale_cap = ctx
+    let timeout_budget_secs = ctx
         .pacing
-        .message_timeout_scale_max
-        .unwrap_or(CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP);
-    let timeout_budget_secs = channel_message_timeout_budget_secs_with_cap(
-        ctx.message_timeout_secs,
-        ctx.max_tool_iterations,
-        scale_cap,
-    );
+        .message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
     let cost_tracking_context = ctx.cost_tracking.clone().map(|state| {
         zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::new(
             state.tracker,

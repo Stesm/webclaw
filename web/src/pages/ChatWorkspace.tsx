@@ -5,11 +5,13 @@ import { ChatTabBar, type TabIndicator, type WorkspaceLayout } from '@/component
 import { basePath } from '@/lib/basePath';
 import {
   applySessionChange,
+  initialWorkspaceState,
   loadPersisted,
   makeTab,
   reservationsByKey,
   STORAGE_KEY,
   tabForOpenRequest,
+  tabForSessionRequest,
   type ChatTab,
   type PersistedState,
 } from '@/pages/chatWorkspace.state';
@@ -30,6 +32,10 @@ export interface ChatWorkspaceProps {
    * whenever it changes (deep links / "Open chat"), without remounting the
    * workspace. */
   initialAlias: string;
+  /** Conversation named by the `?session=` deep link. When present the pane
+   * for it is opened or activated with priority over the pointer-based
+   * resolution above. */
+  initialSessionId?: string;
 }
 
 /**
@@ -41,28 +47,18 @@ export interface ChatWorkspaceProps {
  * so background chats stay connected and keep streaming. A pane only unmounts —
  * and its socket only closes — when its tab is explicitly closed.
  */
-export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
+export default function ChatWorkspace({ initialAlias, initialSessionId }: ChatWorkspaceProps) {
   const persisted = useRef<Partial<PersistedState>>(loadPersisted());
 
-  const [tabs, setTabs] = useState<ChatTab[]>(() => {
-    const stored = persisted.current.tabs ?? [];
-    // The route's agent is always open, but only add it when it is not already
-    // there — a deep link should land on the existing pane, not fork a new one.
-    return stored.some((tb) => tb.alias === initialAlias)
-      ? stored
-      : [...stored, makeTab(initialAlias)];
-  });
-  // Resolved up front rather than in an effect: an empty first commit would
-  // activate tabs[0] and replaceState the URL to the wrong agent before the
-  // route settled. Prefer the pane that was active when the workspace was
-  // stored, so reloading with two panes of one agent returns to the right one.
-  const [activeKey, setActiveKey] = useState<string>(() => {
-    const preferred = persisted.current.activeKey;
-    const match =
-      tabs.find((tb) => tb.key === preferred && tb.alias === initialAlias) ??
-      tabs.find((tb) => tb.alias === initialAlias);
-    return match?.key ?? tabs[0]?.key ?? '';
-  });
+  // Panes and selection for the first commit, resolved once. A `?session=`
+  // deep link is authoritative about which conversation to show, so the pane
+  // for it wins the active slot even when it belongs to another agent; that is
+  // also why this cannot be derived from the route alias alone.
+  const [initialPanes] = useState(() =>
+    initialWorkspaceState(persisted.current, initialAlias, initialSessionId),
+  );
+  const [tabs, setTabs] = useState<ChatTab[]>(initialPanes.tabs);
+  const [activeKey, setActiveKey] = useState<string>(initialPanes.activeKey);
   const [layout, setLayout] = useState<WorkspaceLayout>(persisted.current.layout ?? 'tabs');
   const [splitKeys, setSplitKeys] = useState<[string, string | null]>(
     persisted.current.splitKeys ?? ['', null],
@@ -70,6 +66,11 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
 
   const tabsRef = useRef(tabs);
   useEffect(() => { tabsRef.current = tabs; }, [tabs]);
+
+  // Set while a `?session=` request is in effect, so the route-alias effect
+  // skips exactly the commit that consumes it (prop flips back to undefined)
+  // instead of fighting the link for activation. See both effects below.
+  const appliedSessionRequestRef = useRef(false);
 
   const activeKeyRef = useRef(activeKey);
   useEffect(() => { activeKeyRef.current = activeKey; }, [activeKey]);
@@ -172,6 +173,18 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
   // Activates the agent's FIRST open pane rather than forking another: a deep
   // link means "show me this agent", not "give me one more of it".
   useEffect(() => {
+    // A `?session=` link names the exact pane to show, including one belonging
+    // to another agent; letting this alias rule activate the route agent's own
+    // pane would undo that. The session effect below owns activation then, and
+    // this one stays out until the request has been consumed — otherwise the
+    // commit that consumes it (prop flips to undefined) would immediately
+    // re-activate the route agent's pane over the linked one.
+    if (initialSessionId) return;
+    if (appliedSessionRequestRef.current) {
+      appliedSessionRequestRef.current = false;
+      return;
+    }
+
     // Already showing this agent — including on mount, where the initial state
     // above resolved it. Bailing keeps this idempotent under StrictMode's
     // double-invoked effects, which would otherwise re-activate the agent's
@@ -187,7 +200,23 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
     const tab = makeTab(initialAlias);
     setTabs((prev) => (prev.some((tb) => tb.alias === initialAlias) ? prev : [...prev, tab]));
     setActiveKey(tab.key);
-  }, [initialAlias]);
+  }, [initialAlias, initialSessionId]);
+
+  // Apply a `?session=` deep link that arrives while the workspace is already
+  // mounted — the workspace is never remounted for query-only navigations, so
+  // without this a second dashboard click would be ignored. Mount-time
+  // application is already baked into the initial state above; on that first
+  // run this resolves to a no-op (the pane exists, or the link's conversation
+  // is already active). The parent consumes the parameter out of the URL on the
+  // next commit; `tabForSessionRequest` is idempotent, so a repeat run against
+  // the pre-consume value changes nothing.
+  useEffect(() => {
+    if (!initialSessionId) return;
+    const resolved = tabForSessionRequest(tabsRef.current, initialAlias, initialSessionId);
+    if (resolved.tabs !== tabsRef.current) setTabs(resolved.tabs);
+    setActiveKey(resolved.activeKey);
+    appliedSessionRequestRef.current = true;
+  }, [initialSessionId, initialAlias]);
 
   // Persist workspace shape on any structural change.
   useEffect(() => {

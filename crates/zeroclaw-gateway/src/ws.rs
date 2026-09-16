@@ -19,6 +19,7 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use zeroclaw_api::agent::AttachmentRef;
 use zeroclaw_api::channel::ChannelApprovalResponse;
 use zeroclaw_runtime::sop::approval::{
     ApprovalDecision as SopApprovalDecision, ApprovalPrincipal as SopApprovalPrincipal,
@@ -199,6 +200,11 @@ pub async fn handle_ws_chat(
 
 /// Gateway session key prefix to avoid collisions with channel sessions.
 const GW_SESSION_PREFIX: &str = "gw_";
+
+/// Bounded buffer between the agent turn and the socket forwarder. It is
+/// bounded on purpose, which is why the forwarder must keep draining after a
+/// disconnect: a stopped consumer blocks the agent's `send().await`.
+const WS_TURN_EVENT_CHANNEL_CAPACITY: usize = 64;
 
 fn websocket_ping_interval(
     config: &zeroclaw_config::schema::Config,
@@ -398,7 +404,37 @@ async fn handle_socket(
         // Stamp the agent alias so future /api/sessions queries and
         // per-agent filters can attribute this session to its agent.
         let _ = backend.set_session_agent_alias(&session_key, &agent_alias);
+
+        // A previous turn that was dropped uncleanly (daemon-reload abort,
+        // panic) leaves `state = "running"` with no live cancel token. Reconcile
+        // it to idle on attach so a reconnecting client is not told a dead turn
+        // is still in progress.
+        let live = session_turn_in_progress(&state, &session_key);
+        if !live
+            && backend
+                .get_session_state(&session_key)
+                .ok()
+                .flatten()
+                .is_some_and(|state| state.state == "running")
+        {
+            let _ = backend.set_session_state(&session_key, "idle", None);
+        }
     }
+
+    // Subscribe to the shared broadcast channel BEFORE reading the live-turn
+    // state and sending `session_start`. A background turn's `turn_done` frame
+    // can otherwise land in the window between the two, and the reconnected
+    // viewer would spin forever waiting for a terminal frame it missed.
+    let mut broadcast_rx = state.event_tx.subscribe();
+
+    let session_running = session_turn_in_progress(&state, &session_key);
+
+    // A connection that attached while another connection owned a turn was
+    // seeded from the backend before that turn persisted its reply. Re-read the
+    // canonical backend once, on its first local turn, instead of reseeding on
+    // every turn (which would flatten the structured tool-call history this
+    // connection accumulates while it is the writer).
+    let mut reseed_before_next_turn = session_running;
 
     // Send session_start message to client
     let mut session_start = serde_json::json!({
@@ -406,9 +442,18 @@ async fn handle_socket(
         "session_id": session_id,
         "resumed": resumed,
         "message_count": message_count,
+        "running": session_running,
     });
     if let Some(ref name) = effective_name {
         session_start["name"] = serde_json::Value::String(name.clone());
+    }
+    // Hand a reconnecting viewer the running turn's accumulated tools/text so
+    // the reopened tab shows progress instead of an opaque spinner.
+    if session_running
+        && let Some(progress) = session_turn_progress(&state, &session_key)
+        && let Ok(value) = serde_json::to_value(&progress)
+    {
+        session_start["progress"] = value;
     }
     let _ = sender
         .send(Message::Text(session_start.to_string().into()))
@@ -502,8 +547,10 @@ async fn handle_socket(
             Some(&session_cwd),
             true,
             false,
-            // The gateway WebSocket turn does not transport ACP file attachments.
-            false,
+            // The web WebSocket turn transports the typed file attachment
+            // `deliver_file` emits, framing it on `tool_result` and persisting
+            // it on the session message — so the tool must be registered here.
+            true,
             state.sop_engine.clone(),
             state.sop_audit.clone(),
             Some(state.canvas_store.clone()),
@@ -598,33 +645,46 @@ async fn handle_socket(
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
             if parsed["type"].as_str() == Some("message") {
                 if let Some(content) = first_chat_message_content(text) {
-                    let _session_guard = match state.session_queue.acquire(&session_key).await {
-                        Ok(guard) => guard,
-                        Err(e) => {
-                            let err = serde_json::json!({
-                                "type": "error",
-                                "message": e.to_string(),
-                                "code": session_queue_ws_error_code(&e)
-                            });
-                            let _ = sender.send(Message::Text(err.to_string().into())).await;
-                            return;
+                    if session_turn_in_progress(&state, &session_key) {
+                        // Another connection owns the in-flight turn. Stay a
+                        // viewer: surface the state, receive the terminal
+                        // `turn_done`, and let the client rehydrate.
+                        let err = turn_in_progress_ws_frame(&session_id);
+                        let _ = sender.send(Message::Text(err.to_string().into())).await;
+                    } else {
+                        let _session_guard = match state.session_queue.acquire(&session_key).await {
+                            Ok(guard) => guard,
+                            Err(e) => {
+                                let err = serde_json::json!({
+                                    "type": "error",
+                                    "message": e.to_string(),
+                                    "code": session_queue_ws_error_code(&e)
+                                });
+                                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                return;
+                            }
+                        };
+                        if reseed_before_next_turn {
+                            reseed_agent_history(&state, &mut agent, &session_key, &mut sender)
+                                .await;
+                            reseed_before_next_turn = false;
                         }
-                    };
-                    process_chat_message(
-                        &state,
-                        &mut agent,
-                        &mut sender,
-                        &mut receiver,
-                        &mut approval_event_rx,
-                        &pending_approvals,
-                        &mut ping_interval,
-                        &ws_memory,
-                        &content,
-                        &session_key,
-                        &session_id,
-                        auth_subject.as_deref(),
-                    )
-                    .await;
+                        process_chat_message(
+                            &state,
+                            &mut agent,
+                            &mut sender,
+                            &mut receiver,
+                            &mut approval_event_rx,
+                            &pending_approvals,
+                            &mut ping_interval,
+                            &ws_memory,
+                            &content,
+                            &session_key,
+                            &session_id,
+                            auth_subject.as_deref(),
+                        )
+                        .await;
+                    }
                 }
             } else {
                 let unknown_type = parsed["type"].as_str().unwrap_or("unknown");
@@ -645,10 +705,9 @@ async fn handle_socket(
         }
     }
 
-    // Subscribe to the shared broadcast channel so cron/heartbeat events
-    // are forwarded to this WebSocket client.
-    let mut broadcast_rx = state.event_tx.subscribe();
-
+    // The broadcast subscription was created before `session_start` so no
+    // background-turn terminal frame is missed in the attach window; the loop
+    // below just consumes it.
     loop {
         tokio::select! {
             // ── Keepalive ─────────────────────────────────────────────
@@ -768,6 +827,15 @@ async fn handle_socket(
                     continue;
                 }
 
+                // Another connection owns an in-flight turn for this session.
+                // Do not queue behind it (the provider retry can outlast the
+                // 30s lock timeout): stay a viewer until `turn_done`.
+                if session_turn_in_progress(&state, &session_key) {
+                    let err = turn_in_progress_ws_frame(&session_id);
+                    let _ = sender.send(Message::Text(err.to_string().into())).await;
+                    continue;
+                }
+
                 // Acquire session lock to serialize concurrent turns
                 let _session_guard = match state.session_queue.acquire(&session_key).await {
                     Ok(guard) => guard,
@@ -782,6 +850,10 @@ async fn handle_socket(
                     }
                 };
 
+                if reseed_before_next_turn {
+                    reseed_agent_history(&state, &mut agent, &session_key, &mut sender).await;
+                    reseed_before_next_turn = false;
+                }
                 process_chat_message(
                     &state,
                     &mut agent,
@@ -901,6 +973,7 @@ fn persist_conversation_messages(
     backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
     session_key: &str,
     messages: &[zeroclaw_providers::ConversationMessage],
+    attachments: &[AttachmentRef],
 ) {
     // if the user deleted the session between the turn starting and
     // the post-turn persistence, don't resurrect it. The `aborted` / `done`
@@ -909,14 +982,103 @@ fn persist_conversation_messages(
     if !backend.session_exists(session_key) {
         return;
     }
-    for message in messages {
+    // Attachments produced during the turn belong to the turn's final assistant
+    // message, which is the visible reply the client renders beneath the bubble.
+    let last_assistant_idx = messages.iter().rposition(|message| {
+        matches!(
+            message,
+            zeroclaw_providers::ConversationMessage::Chat(message) if message.role == "assistant"
+        )
+    });
+    for (idx, message) in messages.iter().enumerate() {
         let zeroclaw_providers::ConversationMessage::Chat(message) = message else {
             continue;
         };
         if message.role == "system" {
             continue;
         }
-        let _ = backend.append(session_key, message);
+        if Some(idx) == last_assistant_idx && !attachments.is_empty() {
+            let _ = backend.append_with_attachments(session_key, message, attachments);
+        } else {
+            let _ = backend.append(session_key, message);
+        }
+    }
+}
+
+/// Notify all open chat sockets that a turn for this session reached a
+/// terminal state and its messages are persisted. Survivors of a WS
+/// disconnect (our keep-turn-on-close patch) stream into a dead socket, so
+/// without this frame no live client ever learns the response landed and
+/// cannot rehydrate the transcript.
+fn broadcast_turn_done(state: &AppState, session_id: &str, status: &str) {
+    let _ = state.event_tx.send(serde_json::json!({
+        "type": "turn_done",
+        "session_id": session_id,
+        "status": status,
+    }));
+}
+
+/// Whether a turn is live for this session in this process. The cancel-token
+/// map is the in-process liveness signal: a WS turn inserts its token before
+/// acquiring the session queue and removes it after persistence, so a present
+/// token means another connection owns an in-flight turn and this connection
+/// must not start a second one (which would block on the queue lock and time
+/// out behind a long provider retry).
+fn session_turn_in_progress(state: &AppState, session_key: &str) -> bool {
+    state
+        .active_turns
+        .lock()
+        .expect("active_turns lock poisoned")
+        .contains_key(session_key)
+}
+
+/// Read a running turn's progress snapshot for a (re)connecting viewer.
+fn session_turn_progress(
+    state: &AppState,
+    session_key: &str,
+) -> Option<crate::live_turn::TurnProgress> {
+    state
+        .active_turns
+        .lock()
+        .expect("active_turns lock poisoned")
+        .get(session_key)
+        .map(|turn| turn.progress())
+}
+
+fn turn_in_progress_ws_frame(session_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "turn_in_progress",
+        "session_id": session_id,
+    })
+}
+
+/// Re-hydrate the connection's agent from the durable session backend before a
+/// turn. The per-connection `Agent` seeds history only on connect, so a
+/// connection that attached while a background turn was still running would
+/// otherwise carry a stale transcript (missing that turn's reply) into its next
+/// request. The backend is the canonical source, so reset and reseed from it.
+async fn reseed_agent_history(
+    state: &AppState,
+    agent: &mut zeroclaw_runtime::agent::Agent,
+    session_key: &str,
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+) {
+    let Some(ref backend) = state.session_backend else {
+        return;
+    };
+    let messages = backend.load(session_key);
+    if messages.is_empty() {
+        return;
+    }
+    agent.clear_history();
+    if let Some(zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+        dropped_messages,
+        kept_turns,
+        reason,
+    }) = agent.seed_history_with_event(&messages)
+    {
+        let frame = history_trimmed_ws_frame(dropped_messages, kept_turns, &reason);
+        let _ = sender.send(Message::Text(frame.to_string().into())).await;
     }
 }
 
@@ -928,6 +1090,48 @@ fn has_assistant_chat_message(messages: &[zeroclaw_providers::ConversationMessag
                 if message.role == "assistant"
         )
     })
+}
+
+/// Assistant text to persist for a turn that ended in an error, or `None` when
+/// there is nothing worth adding.
+///
+/// A failed turn persists `error.new_messages`, which carries only the messages
+/// the loop committed — and the gateway's persistence filter drops every
+/// non-`Chat` entry, so tool-only rounds leave nothing behind. The text the
+/// operator actually watched stream in therefore lives outside `new_messages`,
+/// in one of two places:
+///
+/// - `committed_response`: the loop's own record of finished rounds. Preferred,
+///   because it also covers output delivered without live streaming.
+/// - `accumulated_text`: the WebSocket chunks relayed this turn. Used when the
+///   loop committed nothing, which is exactly the tool-only case — the loop
+///   stamps `committed_response` with a bare interruption marker there, and
+///   without this fallback the visible output of a turn that dies mid-flight
+///   (provider out of credit, upstream failure) is lost.
+///
+/// A turn whose `new_messages` already ends in assistant text is left alone:
+/// the committed reply is authoritative, and appending the streamed superset
+/// would duplicate it.
+fn error_turn_partial_assistant_text(
+    messages: &[zeroclaw_providers::ConversationMessage],
+    committed_response: &str,
+    accumulated_text: &str,
+) -> Option<String> {
+    if has_assistant_chat_message(messages) {
+        return None;
+    }
+    let marker = zeroclaw_runtime::i18n::get_required_cli_string("turn-stream-interrupted");
+    let committed = committed_response.trim();
+    // A marker-only `committed_response` is the loop saying "nothing was
+    // committed"; it is not user-visible output.
+    if !committed.is_empty() && committed != marker {
+        return Some(committed.to_string());
+    }
+    let streamed = accumulated_text.trim();
+    if streamed.is_empty() {
+        return None;
+    }
+    Some(format!("{streamed}\n\n{marker}"))
 }
 
 fn history_trimmed_ws_frame(
@@ -1066,6 +1270,20 @@ async fn process_chat_message(
         cfg.effective_max_context_tokens(&turn_alias) as u64
     };
 
+    // Same wall-clock budget the channel runtime gives one message. Without
+    // this the turn is bounded only by the provider stream's idle timeout and
+    // can hang for the whole connection lifetime, leaving the session `running`
+    // and every later message watching it.
+    let turn_budget_secs = {
+        let cfg = state.config.read();
+        cfg.pacing
+            .message_timeout_budget_secs(
+                cfg.channels.message_timeout_secs,
+                cfg.effective_max_tool_iterations(&turn_alias),
+            )
+            .max(zeroclaw_config::schema::MIN_MESSAGE_TIMEOUT_SECS)
+    };
+
     // Broadcast agent_start event
     let _ = state.event_tx.send(serde_json::json!({
         "type": "agent_start",
@@ -1079,25 +1297,44 @@ async fn process_chat_message(
         let _ = backend.set_session_state(session_key, "running", Some(&turn_id));
     }
 
-    // ── Cancellation token lifecycle ─────────────────────────────
-    // Create a token before the turn starts so the abort endpoint
-    // can cancel it. Remove it after the turn completes regardless
-    // of outcome (normal, error, or cancelled).
+    // ── Active-turn lifecycle ────────────────────────────────────
+    // Register the turn (cancel handle + progress mirror) before it starts so
+    // the abort endpoint can cancel it and a reconnecting viewer can read its
+    // progress. Remove it after the turn completes regardless of outcome.
     let cancel_token = tokio_util::sync::CancellationToken::new();
+    let active_turn = std::sync::Arc::new(crate::live_turn::ActiveTurn::new(
+        turn_id.clone(),
+        cancel_token.clone(),
+    ));
     {
         state
-            .cancel_tokens
+            .active_turns
             .lock()
-            .expect("cancel_tokens lock poisoned")
-            .insert(session_key.to_string(), cancel_token.clone());
+            .expect("active_turns lock poisoned")
+            .insert(session_key.to_string(), active_turn.clone());
     }
 
     // Channel for streaming turn events from the agent.
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+    let (event_tx, mut event_rx) =
+        tokio::sync::mpsc::channel::<TurnEvent>(WS_TURN_EVENT_CHANNEL_CAPACITY);
     let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<String>(32);
 
     let content_owned = content.to_string();
     let session_key_owned = session_key.to_string();
+
+    // Persist the user message immediately so switching away from the chat
+    // and back still shows it while the turn is still running. The turn's
+    // `new_messages` will contain an enriched copy (date prefix); filter it
+    // out at final persistence to avoid a duplicate bubble.
+    let user_persisted_early = if let Some(ref backend) = state.session_backend {
+        backend.session_exists(session_key)
+            && backend
+                .append(session_key, &zeroclaw_providers::ChatMessage::user(content))
+                .is_ok()
+    } else {
+        false
+    };
+
     // The shared Agent turn boundary owns safeguard attribution and returns it
     // alongside the undecorated transcript. This transport only renders the
     // typed result as a standalone WS frame.
@@ -1137,6 +1374,14 @@ async fn process_chat_message(
     // can reconstruct partial content on cancellation.
     let mut accumulated_text = String::new();
 
+    // File attachments (from `deliver_file` artifacts) produced during this
+    // turn. Collected as they stream so the final assistant message can be
+    // persisted with them, and so the `tool_result` frame can carry the
+    // client-safe reference. Deduped by opaque content id.
+    let turn_attachments: Arc<parking_lot::Mutex<Vec<AttachmentRef>>> =
+        Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let forward_attachments = turn_attachments.clone();
+
     // Aggregate token usage across all LLM calls in this turn.
     // The agent emits TurnEvent::Usage once per LLM call when the provider
     // surfaces usage; we sum to produce a single done-frame total.
@@ -1149,6 +1394,17 @@ async fn process_chat_message(
     let mut last_input_tokens: Option<u64> = None;
     let forward_fut = async {
         let mut cancel_drained = false;
+        // Once the socket closes we keep this loop alive to drain the agent's
+        // event channel until it closes. Dropping out instead stops consuming
+        // `event_rx`, so the agent's bounded `event_tx.send().await` blocks at
+        // capacity and the turn never finishes or persists — the session stays
+        // `running` forever and every later message queues behind it.
+        // `socket_alive=false` disables only the branches that touch the dead
+        // socket; the event/approval drains keep the turn making progress.
+        let mut socket_alive = true;
+        // Guards against a busy loop if the approval channel closes early:
+        // `recv()` then returns `None` immediately, so stop polling it.
+        let mut approval_alive = true;
         loop {
             tokio::select! {
                 biased;
@@ -1161,20 +1417,21 @@ async fn process_chat_message(
                     // a ToolLoopCancelled error which closes event_rx and
                     // breaks this loop on the `event_rx.recv()` arm below.
                 }
-                client_msg = receiver.next() => {
+                client_msg = receiver.next(), if socket_alive => {
                     let text = match client_msg {
                         Some(Ok(Message::Text(text))) => text,
                         Some(Ok(Message::Ping(payload))) => {
                             if sender.send(Message::Pong(payload)).await.is_err() {
-                                cancel_token.cancel();
-                                break;
+                                socket_alive = false;
                             }
                             continue;
                         }
                         Some(Ok(Message::Pong(_))) => continue,
                         Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
-                            cancel_token.cancel();
-                            break;
+                            // WS disconnected: keep the agent turn running in
+                            // the background by draining its events below.
+                            socket_alive = false;
+                            continue;
                         }
                         _ => continue,
                     };
@@ -1254,8 +1511,18 @@ async fn process_chat_message(
                         _ => {}
                     }
                 }
-                approval = approval_event_rx.recv() => {
-                    let Some(event) = approval else { continue };
+                approval = approval_event_rx.recv(), if approval_alive => {
+                    // Keep draining even after the socket dies so the approval
+                    // channel cannot fill and block the agent; a dead socket
+                    // simply discards the request and the runtime's approval
+                    // timeout resolves it.
+                    let Some(event) = approval else {
+                        approval_alive = false;
+                        continue;
+                    };
+                    if !socket_alive {
+                        continue;
+                    }
                     if let TurnEvent::ApprovalRequest {
                         request_id,
                         tool_name,
@@ -1272,10 +1539,11 @@ async fn process_chat_message(
                         let _ = sender.send(Message::Text(frame.to_string().into())).await;
                     }
                 }
-                _ = tick_websocket_ping(ping_interval) => {
+                _ = tick_websocket_ping(ping_interval), if socket_alive => {
                     if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
-                        cancel_token.cancel();
-                        break;
+                        // Socket dead: keep draining the turn's events below so
+                        // it can finish and persist.
+                        socket_alive = false;
                     }
                 }
                     event_opt = event_rx.recv() => {
@@ -1298,18 +1566,44 @@ async fn process_chat_message(
                         }
                         TurnEvent::Chunk { ref delta } => {
                             accumulated_text.push_str(delta);
+                            active_turn.append_text(delta);
                             serde_json::json!({ "type": "chunk", "content": delta })
                         }
                         TurnEvent::Thinking { delta } => {
+                            active_turn.append_thinking(&delta);
                             serde_json::json!({ "type": "thinking", "content": delta })
                         }
                         TurnEvent::ToolCall { id, name, args } => {
+                            active_turn.record_tool_call(id.clone(), name.clone(), args.clone());
                             serde_json::json!({ "type": "tool_call", "id": id, "name": name, "args": args })
                         }
                         TurnEvent::ToolResult {
-                            id, name, output, ..
+                            id, name, output, artifact,
                         } => {
-                            serde_json::json!({ "type": "tool_result", "id": id, "name": name, "output": output })
+                            active_turn.record_tool_result(&id, &name, output.clone());
+                            // A file-producing tool (`deliver_file`) carries a
+                            // typed artifact. Project it to a client-safe
+                            // reference (host path dropped) and remember it for
+                            // the turn's final assistant message.
+                            let attachment = artifact.as_ref().map(|a| a.into_ref()).filter(|r| !r.id.is_empty());
+                            if let Some(ref r) = attachment {
+                                let mut collected = forward_attachments
+                                    .lock();
+                                if !collected.iter().any(|existing| existing.id == r.id) {
+                                    collected.push(r.clone());
+                                }
+                            }
+                            let mut frame = serde_json::json!({
+                                "type": "tool_result",
+                                "id": id,
+                                "name": name,
+                                "output": output,
+                            });
+                            if let Some(r) = attachment {
+                                frame["attachment"] = serde_json::to_value(r)
+                                    .unwrap_or(serde_json::Value::Null);
+                            }
+                            frame
                         }
                         TurnEvent::ApprovalRequest {
                             request_id,
@@ -1333,22 +1627,88 @@ async fn process_chat_message(
                             "entries": entries,
                         }),
                     };
-                    let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
+                    // Discard frames once the socket is gone; the turn still
+                    // persists and a later attach rehydrates from the backend.
+                    if socket_alive {
+                        let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
+                    }
                 }
             }
         }
     };
 
-    let (result, ()) = tokio::join!(turn_fut, forward_fut);
+    let (turn_result, ()) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(turn_budget_secs), turn_fut),
+        forward_fut
+    );
 
-    // ── Remove cancel token (turn finished) ──────────────────────
+    let turn_attachments: Vec<AttachmentRef> = turn_attachments.lock().clone();
+
+    // ── Remove the active turn (turn finished) ───────────────────
     {
         state
-            .cancel_tokens
+            .active_turns
             .lock()
-            .expect("cancel_tokens lock poisoned")
+            .expect("active_turns lock poisoned")
             .remove(session_key);
     }
+
+    // The turn exceeded the shared message budget. Abort it, close the orphan
+    // turn in the transcript, and unblock the session so later messages are not
+    // stuck behind it (channel runtime behaves the same way).
+    let result = match turn_result {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            cancel_token.cancel();
+            let marker =
+                zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-request-timeout");
+            if let Some(ref backend) = state.session_backend
+                && backend.session_exists(session_key)
+            {
+                let truncated = if accumulated_text.is_empty() {
+                    marker.clone()
+                } else {
+                    format!("{accumulated_text}\n\n{marker}")
+                };
+                let _ = backend.append_with_attachments(
+                    session_key,
+                    &zeroclaw_providers::ChatMessage::assistant(&truncated),
+                    &turn_attachments,
+                );
+                let _ = backend.set_session_state(session_key, "idle", None);
+            }
+            // The dropped turn future may have left the in-memory agent history
+            // mid-step. Re-read the canonical transcript (now ending in the
+            // timeout marker) so the next turn on this connection is coherent.
+            reseed_agent_history(state, agent, session_key, sender).await;
+            broadcast_turn_done(state, session_id, "timeout");
+            let err = serde_json::json!({
+                "type": "error",
+                "message": marker,
+                "code": "TURN_TIMEOUT",
+            });
+            let _ = sender.send(Message::Text(err.to_string().into())).await;
+            let _ = state.event_tx.send(serde_json::json!({
+                "type": "agent_end",
+                "model_provider": provider_label,
+                "model": turn_model,
+            }));
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Timeout)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "model_provider": provider_label,
+                        "model": turn_model,
+                        "session_key": session_key,
+                        "budget_secs": turn_budget_secs,
+                        "trace_id": turn_id,
+                    })),
+                "gateway_ws_turn"
+            );
+            return;
+        }
+    };
 
     // Check if this turn was cancelled. `turn_streamed` propagates
     // `ToolLoopCancelled` through anyhow, so we detect it here.
@@ -1367,6 +1727,7 @@ async fn process_chat_message(
                             backend.as_ref(),
                             session_key,
                             &error.new_messages,
+                            &turn_attachments,
                         );
                         if !has_assistant_chat_message(&error.new_messages) {
                             let marker = zeroclaw_runtime::i18n::get_required_cli_string(
@@ -1384,7 +1745,11 @@ async fn process_chat_message(
                             // here; `persist_conversation_messages` already
                             // re-checks internally.
                             if backend.session_exists(session_key) {
-                                let _ = backend.append(session_key, &assistant_msg);
+                                let _ = backend.append_with_attachments(
+                                    session_key,
+                                    &assistant_msg,
+                                    &turn_attachments,
+                                );
                             }
                         }
                     }
@@ -1399,7 +1764,11 @@ async fn process_chat_message(
                         };
                         let assistant_msg = zeroclaw_providers::ChatMessage::assistant(&truncated);
                         if backend.session_exists(session_key) {
-                            let _ = backend.append(session_key, &assistant_msg);
+                            let _ = backend.append_with_attachments(
+                                session_key,
+                                &assistant_msg,
+                                &turn_attachments,
+                            );
                         }
                     }
                 }
@@ -1407,6 +1776,7 @@ async fn process_chat_message(
         }
 
         // Inform the client the turn was aborted
+        broadcast_turn_done(state, session_id, "aborted");
         let aborted = serde_json::json!({ "type": "aborted" });
         let _ = sender.send(Message::Text(aborted.to_string().into())).await;
 
@@ -1446,8 +1816,43 @@ async fn process_chat_message(
     match result {
         Ok(outcome) => {
             if let Some(ref backend) = state.session_backend {
-                persist_conversation_messages(backend.as_ref(), session_key, &outcome.new_messages);
+                // The user message was already persisted when the turn
+                // started; skip it here to avoid a duplicate row. The turn's
+                // canonical copy carries an enrichment prefix (date/time), so
+                // match by containment against the original content.
+                let filtered_new_messages: Vec<zeroclaw_providers::ConversationMessage> =
+                    if user_persisted_early {
+                        outcome
+                            .new_messages
+                            .iter()
+                            .enumerate()
+                            .filter(|(idx, msg)| {
+                                if *idx != 0 {
+                                    return true;
+                                }
+                                match msg {
+                                    zeroclaw_providers::ConversationMessage::Chat(m)
+                                        if m.role == "user" =>
+                                    {
+                                        !m.content.contains(&content_owned)
+                                    }
+                                    _ => true,
+                                }
+                            })
+                            .map(|(_, msg)| msg.clone())
+                            .collect()
+                    } else {
+                        outcome.new_messages.clone()
+                    };
+                persist_conversation_messages(
+                    backend.as_ref(),
+                    session_key,
+                    &filtered_new_messages,
+                    &turn_attachments,
+                );
             }
+
+            broadcast_turn_done(state, session_id, "completed");
 
             // Fire-and-forget memory consolidation so facts from WS sessions
             // are extracted to long-term memory (Daily + Core categories).
@@ -1561,11 +1966,66 @@ async fn process_chat_message(
             );
         }
         Err(e) => {
-            if let Some(ref backend) = state.session_backend
-                && !e.new_messages.is_empty()
-            {
-                persist_conversation_messages(backend.as_ref(), session_key, &e.new_messages);
+            if let Some(ref backend) = state.session_backend {
+                let filtered_new_messages: Vec<zeroclaw_providers::ConversationMessage> =
+                    if user_persisted_early {
+                        e.new_messages
+                            .iter()
+                            .enumerate()
+                            .filter(|(idx, msg)| {
+                                if *idx != 0 {
+                                    return true;
+                                }
+                                match msg {
+                                    zeroclaw_providers::ConversationMessage::Chat(m)
+                                        if m.role == "user" =>
+                                    {
+                                        !m.content.contains(&content_owned)
+                                    }
+                                    _ => true,
+                                }
+                            })
+                            .map(|(_, msg)| msg.clone())
+                            .collect()
+                    } else {
+                        e.new_messages.clone()
+                    };
+                persist_conversation_messages(
+                    backend.as_ref(),
+                    session_key,
+                    &filtered_new_messages,
+                    &turn_attachments,
+                );
+                // Persist what the operator watched stream in before the
+                // failure. The error frame below still reports the fault; this
+                // only stops a mid-flight turn from leaving an empty gap where
+                // its visible output used to be.
+                if let Some(partial) = error_turn_partial_assistant_text(
+                    &filtered_new_messages,
+                    &e.committed_response,
+                    &accumulated_text,
+                ) && backend.session_exists(session_key)
+                {
+                    let _ = backend.append_with_attachments(
+                        session_key,
+                        &zeroclaw_providers::ChatMessage::assistant(&partial),
+                        &turn_attachments,
+                    );
+                }
+                let user_message =
+                    zeroclaw_runtime::agent::terminal_completion_error_message(&e.error, None);
+                if let Some(user_message) = user_message
+                    && backend.session_exists(session_key)
+                {
+                    let _ = backend.append_with_attachments(
+                        session_key,
+                        &zeroclaw_providers::ChatMessage::assistant(&user_message),
+                        &turn_attachments,
+                    );
+                }
             }
+
+            broadcast_turn_done(state, session_id, "error");
 
             // Set session state to error
             if let Some(ref backend) = state.session_backend {
@@ -2544,60 +3004,39 @@ data: {\"type\":\"message_stop\"}\n\n",
         );
     }
 
-    // The mid-turn `client_msg` arm in `forward_fut`
-    // must (a) classify stream-end / close / error frames as "client gone"
-    // and (b) cancel the turn token so `tokio::join!(turn_fut, forward_fut)`
-    // can return — a bare `continue` hot-loops the select forever.
-    #[derive(Debug, PartialEq, Eq)]
-    enum DisconnectAction {
-        Break,
-        Continue,
-        ProcessText,
-    }
+    // A WS disconnect must NOT stop draining the agent's bounded event
+    // channel. The forward loop keeps consuming events after the socket dies
+    // (`socket_alive = false` only stops touching the dead socket); the old
+    // behavior `break`-ed out, so the agent's `event_tx.send().await` blocked
+    // at capacity and the turn never finished or persisted, leaving the session
+    // `running` forever. This models that invariant with the production
+    // capacity: a producer of many more events than the buffer must complete.
+    #[tokio::test]
+    async fn disconnected_socket_still_drains_turn_events() {
+        use zeroclaw_runtime::agent::TurnEvent;
 
-    fn classify_client_msg(
-        msg: Option<Result<axum::extract::ws::Message, &'static str>>,
-    ) -> DisconnectAction {
-        use axum::extract::ws::Message;
-        match msg {
-            Some(Ok(Message::Text(_))) => DisconnectAction::ProcessText,
-            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => DisconnectAction::Break,
-            _ => DisconnectAction::Continue,
-        }
-    }
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(WS_TURN_EVENT_CHANNEL_CAPACITY);
+        let producer = zeroclaw_spawn::spawn!(async move {
+            for _ in 0..(WS_TURN_EVENT_CHANNEL_CAPACITY * 4) {
+                if tx
+                    .send(TurnEvent::Chunk {
+                        delta: "x".to_string(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let drain = async { while rx.recv().await.is_some() {} };
 
-    #[test]
-    fn mid_turn_client_msg_breaks_on_stream_end_close_or_err() {
-        use axum::extract::ws::Message;
-        assert_eq!(classify_client_msg(None), DisconnectAction::Break);
-        assert_eq!(
-            classify_client_msg(Some(Ok(Message::Close(None)))),
-            DisconnectAction::Break,
-        );
-        assert_eq!(
-            classify_client_msg(Some(Err("io"))),
-            DisconnectAction::Break,
-        );
-        assert_eq!(
-            classify_client_msg(Some(Ok(Message::Ping(Default::default())))),
-            DisconnectAction::Continue,
-        );
-        assert_eq!(
-            classify_client_msg(Some(Ok(Message::Text("{}".into())))),
-            DisconnectAction::ProcessText,
-        );
-    }
-
-    #[test]
-    fn mid_turn_disconnect_cancel_unblocks_joined_turn() {
-        let token = tokio_util::sync::CancellationToken::new();
-        let clone_for_turn = token.clone();
-        assert!(!clone_for_turn.is_cancelled());
-        token.cancel();
-        assert!(
-            clone_for_turn.is_cancelled(),
-            "cloned token (held by turn_fut via agent.turn_streamed) must observe cancellation"
-        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (produced, ()) = tokio::join!(producer, drain);
+            produced.expect("producer task must not panic");
+        })
+        .await
+        .expect("producer must not block when the consumer keeps draining");
     }
 
     #[test]
@@ -2661,13 +3100,81 @@ data: {\"type\":\"message_stop\"}\n\n",
             ConversationMessage::Chat(ChatMessage::assistant("[interrupted by user]")),
         ];
 
-        persist_conversation_messages(&backend, "gw_deleted", &messages);
+        persist_conversation_messages(&backend, "gw_deleted", &messages, &[]);
 
         assert!(
             backend.append_calls.lock().unwrap().is_empty(),
             "persist_conversation_messages must not resurrect a session whose \
              session_exists() returned false (see #7126)"
         );
+    }
+
+    // ── Error-turn partial persistence ──────────────────────────────
+
+    #[test]
+    fn error_turn_persists_streamed_text_when_the_loop_committed_nothing() {
+        use zeroclaw_providers::{ChatMessage, ConversationMessage};
+
+        // The failure case that motivated this: tool-only rounds, provider runs
+        // out of credit mid-turn, `new_messages` holds just the user turn and
+        // `committed_response` is a bare marker. The text the operator watched
+        // stream in must survive in the transcript.
+        let marker = zeroclaw_runtime::i18n::get_required_cli_string("turn-stream-interrupted");
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("hi"))];
+
+        let partial =
+            error_turn_partial_assistant_text(&messages, &marker, "Снимаю точные байты эталона");
+
+        assert_eq!(
+            partial.as_deref(),
+            Some(format!("Снимаю точные байты эталона\n\n{marker}").as_str())
+        );
+    }
+
+    #[test]
+    fn error_turn_prefers_committed_response_over_the_streamed_superset() {
+        use zeroclaw_providers::{ChatMessage, ConversationMessage};
+
+        // `committed_response` is the loop's own finished-round record; the
+        // streamed text spans earlier rounds too, so appending both would
+        // duplicate what the loop already committed.
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("hi"))];
+
+        let partial =
+            error_turn_partial_assistant_text(&messages, "finished round", "round one round two");
+
+        assert_eq!(partial.as_deref(), Some("finished round"));
+    }
+
+    #[test]
+    fn error_turn_does_not_duplicate_an_assistant_message_already_committed() {
+        use zeroclaw_providers::{ChatMessage, ConversationMessage};
+
+        let messages = vec![
+            ConversationMessage::Chat(ChatMessage::user("hi")),
+            ConversationMessage::Chat(ChatMessage::assistant("the reply")),
+        ];
+
+        assert_eq!(
+            error_turn_partial_assistant_text(&messages, "the reply", "the reply"),
+            None
+        );
+    }
+
+    #[test]
+    fn error_turn_adds_nothing_when_no_output_was_visible() {
+        use zeroclaw_providers::{ChatMessage, ConversationMessage};
+
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("hi"))];
+        let marker = zeroclaw_runtime::i18n::get_required_cli_string("turn-stream-interrupted");
+
+        // A turn that failed before any text reached the operator has nothing
+        // to preserve; the error frame is the whole story.
+        assert_eq!(
+            error_turn_partial_assistant_text(&messages, &marker, "   \n "),
+            None
+        );
+        assert_eq!(error_turn_partial_assistant_text(&messages, "", ""), None);
     }
 
     /// A `Sink<Message>` that just collects the text frames sent to it, so a handler

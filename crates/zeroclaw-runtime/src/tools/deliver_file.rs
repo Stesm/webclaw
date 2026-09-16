@@ -177,9 +177,10 @@ impl Tool for DeliverFileTool {
     }
 
     fn description(&self) -> &str {
-        "Deliver a file from the workspace to the ACP client as an embedded binary resource \
-         (PDF, DOCX, images, etc.). Use when the user should download or preview the file. \
-         Path must stay inside the workspace. On success the result includes `uri` \
+        "Deliver a file from the workspace to the chat client (web dashboard or ACP client) \
+         as a downloadable attachment (PDF, DOCX, images, Markdown, HTML, text, etc.). Use \
+         when the user should download or preview a file you created or found. Path must stay \
+         inside the workspace. On success the result includes `uri` \
          (`attachment://deliver/<content-hash>`) — cite that exact uri in widgets/`[N]`; \
          do not invent prefixes. Pass an optional `title` (any prose) as the client's \
          chat label for the file; it defaults to the filename. Do not invent ACP \

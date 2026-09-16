@@ -1,5 +1,5 @@
-import { memo, useState, useEffect, useRef, useCallback } from 'react';
-import { Link, Navigate, useParams } from 'react-router-dom';
+import { memo, useMemo, useState, useEffect, useRef, useCallback } from 'react';
+import { Link, Navigate, useParams, useSearchParams } from 'react-router-dom';
 import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench, BarChart2, FolderOpen, ImagePlus, Loader2 } from 'lucide-react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -21,6 +21,10 @@ import ChatWorkspace from '@/pages/ChatWorkspace';
 import ToolCallCard from '@/components/ToolCallCard';
 import ApprovalBanner from '@/components/ApprovalBanner';
 import SessionPicker from '@/components/SessionPicker';
+import ChatAttachmentCard from '@/components/ChatAttachmentCard';
+import AttachmentPreviewModal from '@/components/AttachmentPreviewModal';
+import type { WsAttachment } from '@/types/api';
+import { turnProgressToUiMessages } from '@/lib/chatHistoryStorage';
 
 const DRAFT_KEY_PREFIX = 'agent-chat';
 
@@ -75,10 +79,32 @@ function ContextBar({ contextMaxTokens, contextInputTokens }: {
  */
 export default function AgentChat() {
   const { alias } = useParams<{ alias: string }>();
+  const [searchParams, setSearchParams] = useSearchParams();
+  // One-shot conversation request from a dashboard deep link. Read here, not
+  // in the workspace, so query-only navigations still reach it — the workspace
+  // is never remounted (it owns live sockets), so it could not observe them.
+  const requestedSessionId = searchParams.get('session') ?? undefined;
+
+  // Consume the request: the workspace applied it in the same render this
+  // value reached it, so drop the parameter (router-driven, hence `replace`)
+  // to keep the URL honest. A later deep link to the same conversation sets it
+  // again from `undefined`, which is what lets a repeat click land.
+  useEffect(() => {
+    if (!requestedSessionId) return;
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        next.delete('session');
+        return next;
+      },
+      { replace: true },
+    );
+  }, [requestedSessionId, setSearchParams]);
+
   if (!alias) {
     return <Navigate to="/agents" replace />;
   }
-  return <ChatWorkspace initialAlias={alias} />;
+  return <ChatWorkspace initialAlias={alias} initialSessionId={requestedSessionId} />;
 }
 
 /** Status snapshot a chat pane pushes up to the workspace tab bar. */
@@ -127,6 +153,7 @@ export function AgentChatInner({
     respondToApproval,
     contextMaxTokens,
     contextInputTokens,
+    liveProgress,
   } = useAgent();
 
   // Keyed by conversation, not just alias: with the same agent open in two
@@ -214,6 +241,14 @@ export function AgentChatInner({
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, typing, streamingContent]);
+
+  // Re-key the mapped live-progress rows once per snapshot so React remounts
+  // them; the snapshot content (text/tool output) changes each poll under the
+  // same shape, and stable ids would otherwise hide the tool card update.
+  const liveProgressUi = useMemo(
+    () => (liveProgress ? turnProgressToUiMessages(liveProgress) : []),
+    [liveProgress],
+  );
 
   // Close model dropdown when clicking outside
   useEffect(() => {
@@ -456,6 +491,12 @@ export function AgentChatInner({
     deleteMessage(msgId);
   }, [deleteMessage]);
 
+  const [previewAttachment, setPreviewAttachment] = useState<WsAttachment | null>(null);
+  const handlePreviewAttachment = useCallback((attachment: WsAttachment) => {
+    setPreviewAttachment(attachment);
+  }, []);
+  const closePreviewAttachment = useCallback(() => setPreviewAttachment(null), []);
+
   const handleClearAll = useCallback(() => {
     clearAllMessages();
   }, [clearAllMessages]);
@@ -688,13 +729,35 @@ export function AgentChatInner({
               msg={msg}
               idx={idx}
               compact={compact}
+              agentAlias={agentAlias}
               isCopied={copiedId === msg.id}
               onCopy={handleCopy}
               onDelete={handleDeleteMessage}
+              onPreviewAttachment={handlePreviewAttachment}
             />
           ))}
 
-        {typing && (
+        {/* Live progress of a turn another connection owns (e.g. a background
+            turn that survived this tab closing). Rendered from the polled
+            in-memory snapshot so a reopened tab shows the running tools and
+            partial text instead of an opaque spinner. */}
+        {liveProgressUi
+          .filter((msg) => showToolActivity || !msg.toolCall)
+          .map((msg, idx) => (
+            <MessageItem
+              key={msg.id}
+              msg={msg}
+              idx={idx}
+              compact={compact}
+              agentAlias={agentAlias}
+              isCopied={false}
+              onCopy={handleCopy}
+              onDelete={handleDeleteMessage}
+              onPreviewAttachment={handlePreviewAttachment}
+            />
+          ))}
+
+        {typing && liveProgressUi.length === 0 && (
           <div className="flex items-start gap-3 animate-fade-in">
             <div className="flex-shrink-0 w-8 h-8 rounded-[var(--radius-md)] flex items-center justify-center border border-pc-border bg-pc-elevated">
               <Bot className="h-4 w-4 text-pc-accent" />
@@ -725,6 +788,14 @@ export function AgentChatInner({
       {/* Tool approval banner — supervised-mode consent prompt (#6522). */}
       {pendingApproval && (
         <ApprovalBanner pending={pendingApproval} onRespond={respondToApproval} />
+      )}
+
+      {previewAttachment && (
+        <AttachmentPreviewModal
+          attachment={previewAttachment}
+          agentAlias={agentAlias}
+          onClose={closePreviewAttachment}
+        />
       )}
 
       {/* Input area */}
@@ -875,18 +946,22 @@ interface MessageItemProps {
   msg: ChatMessage;
   idx: number;
   compact: boolean;
+  agentAlias: string;
   isCopied: boolean;
   onCopy: (id: string, content: string) => void;
   onDelete: (id: string) => void;
+  onPreviewAttachment: (attachment: WsAttachment) => void;
 }
 
 const MessageItem = memo(function MessageItem({
   msg,
   idx,
   compact,
+  agentAlias,
   isCopied,
   onCopy,
   onDelete,
+  onPreviewAttachment,
 }: MessageItemProps) {
   // Locally-composed user input and locally-generated command output are
   // verbatim and never carry the gateway's `[timestamp]` prefix, so don't strip
@@ -943,6 +1018,14 @@ const MessageItem = memo(function MessageItem({
           ) : (
             <p className={`${compact ? 'text-xs' : 'text-sm'} whitespace-pre-wrap break-words leading-relaxed`}>{cleanContent}</p>
           )}
+          {msg.attachments?.map((attachment) => (
+            <ChatAttachmentCard
+              key={attachment.id}
+              attachment={attachment}
+              agentAlias={agentAlias}
+              onPreview={onPreviewAttachment}
+            />
+          ))}
           {!compact && (
             <p className="text-[10px] mt-1.5 text-pc-text-faint">
               {msg.timestamp.toLocaleTimeString()}

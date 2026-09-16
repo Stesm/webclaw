@@ -10,10 +10,13 @@ import {
   LayoutDashboard,
   Users,
   MessageSquare,
+  MessageSquareText,
   Wifi,
   Plus,
   Trash2,
   Eye,
+  Pencil,
+  Check,
   X,
   Bot,
   Filter,
@@ -43,6 +46,7 @@ import {
   getChannels,
   getSessionMessages,
   deleteSession,
+  renameSession,
   getMemory,
   storeMemory,
   deleteMemory,
@@ -52,6 +56,7 @@ import {
   listProps,
 } from "@/lib/api";
 import { resolveModelToProviderType } from "@/lib/configuredModels";
+import { sessionDisplayTitle } from "@/lib/sessionTitle";
 import DoctorFixModal from "@/components/DoctorFixModal";
 
 type CostWindow = "today" | "7d" | "30d" | "month" | "all";
@@ -412,8 +417,8 @@ const STATUS_CARDS = [
 ];
 
 const TABS: { id: TabId; labelKey: string; icon: typeof LayoutDashboard }[] = [
-  { id: "overview", labelKey: "dashboard.tab_overview", icon: LayoutDashboard },
   { id: "sessions", labelKey: "dashboard.tab_sessions", icon: Users },
+  { id: "overview", labelKey: "dashboard.tab_overview", icon: LayoutDashboard },
   { id: "channels", labelKey: "dashboard.tab_channels", icon: Wifi },
   { id: "memories", labelKey: "dashboard.tab_memories", icon: Brain },
   { id: "health", labelKey: "dashboard.tab_health", icon: Heart },
@@ -943,7 +948,16 @@ function isSessionSort(v: string): v is SessionSort {
   return SESSION_SORT_OPTIONS.some((o) => o.value === v);
 }
 
+// Name shown for a session row and in its inspect header: the operator's name,
+// else the gateway's preview of the first user message, else the raw id (see
+// `lib/sessionTitle`). `sessionTitleIsId` says which one won, so the row can
+// keep the id monospaced without repeating the rule.
+function sessionTitleIsId(session: Session): boolean {
+  return sessionDisplayTitle(session) === session.session_id;
+}
+
 function SessionsTab() {
+  const navigate = useNavigate();
   const [sessions, setSessions] = useState<Session[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -979,6 +993,11 @@ function SessionsTab() {
   const [deleting, setDeleting] = useState<string | null>(null);
   // The session queued for deletion; non-null opens the confirm dialog.
   const [pendingDelete, setPendingDelete] = useState<Session | null>(null);
+  // Inline rename, keyed by session_key so only the edited row swaps its title
+  // for an input. `renaming` gates the request the same way `deleting` does.
+  const [renamingKey, setRenamingKey] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState("");
+  const [renameFailed, setRenameFailed] = useState(false);
 
   const { events } = useSSE({
     filterTypes: ["session_update", "session_created", "session_closed"],
@@ -1095,6 +1114,51 @@ function SessionsTab() {
     } finally {
       setDeleting(null);
     }
+  };
+
+  // Rename in place. The name is the operator's own label and takes over from
+  // the server-derived preview, so the refreshed row shows the new name and the
+  // preview disappears — the gateway stops advertising it once a name exists.
+  const commitRename = async (session: Session) => {
+    const name = renameDraft.trim();
+    if (!name) {
+      setRenamingKey(null);
+      return;
+    }
+    try {
+      await renameSession(session.session_id, name);
+      setSessions((prev) =>
+        prev.map((s) =>
+          s.session_key === session.session_key
+            ? { ...s, name, preview: undefined }
+            : s,
+        ),
+      );
+      if (inspect?.session.session_key === session.session_key) {
+        setInspect((curr) =>
+          curr ? { ...curr, session: { ...curr.session, name, preview: undefined } } : curr,
+        );
+      }
+      setRenamingKey(null);
+      setRenameFailed(false);
+    } catch {
+      // Mostly reached when session persistence is disabled, in which case the
+      // gateway has no row to name. Keep the editor open rather than dropping
+      // what the operator typed.
+      setRenameFailed(true);
+    }
+  };
+
+  const startRename = (session: Session) => {
+    setRenamingKey(session.session_key);
+    setRenameDraft(session.name?.trim() || sessionDisplayTitle(session));
+    setRenameFailed(false);
+  };
+
+  const cancelRename = () => {
+    setRenamingKey(null);
+    setRenameDraft("");
+    setRenameFailed(false);
   };
 
   if (loading) {
@@ -1250,12 +1314,32 @@ function SessionsTab() {
             >
               <div className="flex-1 min-w-0">
                 <div className="flex items-start gap-2 mb-1 flex-wrap">
-                  <span
-                    className="text-sm font-medium font-mono break-all"
-                    style={{ color: "var(--pc-text-primary)" }}
-                  >
-                    {session.session_id}
-                  </span>
+                  {renamingKey === session.session_key ? (
+                    <input
+                      autoFocus
+                      value={renameDraft}
+                      onChange={(e) => setRenameDraft(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          void commitRename(session);
+                        } else if (e.key === "Escape") {
+                          e.preventDefault();
+                          cancelRename();
+                        }
+                      }}
+                      aria-label={t("dashboard.rename_session")}
+                      aria-invalid={renameFailed}
+                      className="input-electric px-2 py-1 text-sm w-full max-w-xs"
+                    />
+                  ) : (
+                    <span
+                      className={`text-sm font-medium break-all ${sessionTitleIsId(session) ? "font-mono" : ""}`}
+                      style={{ color: "var(--pc-text-primary)" }}
+                    >
+                      {sessionDisplayTitle(session)}
+                    </span>
+                  )}
                   {session.agent_alias && (
                     <EntityLink
                       kind="agent"
@@ -1289,14 +1373,76 @@ function SessionsTab() {
                   className="flex items-center gap-3 text-xs"
                   style={{ color: "var(--pc-text-muted)" }}
                 >
+                  {!sessionTitleIsId(session) && (
+                    <span className="font-mono truncate">{session.session_id}</span>
+                  )}
                   <span className="flex items-center gap-1">
                     <MessageSquare className="h-3 w-3" />
                     {session.message_count}
                   </span>
                   <span>{formatRelative(session.last_activity)}</span>
                 </div>
+                {renameFailed && renamingKey === session.session_key && (
+                  <p
+                    role="alert"
+                    className="mt-1 text-[11px]"
+                    style={{ color: "var(--color-status-error)" }}
+                  >
+                    {t("dashboard.rename_session_failed")}
+                  </p>
+                )}
               </div>
               <div className="flex items-center gap-1 flex-shrink-0">
+                {session.agent_alias &&
+                  session.channel_id === null &&
+                  session.session_key.startsWith("gw_") && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        navigate(
+                          `/agent/${encodeURIComponent(session.agent_alias!)}?session=${encodeURIComponent(session.session_id)}`,
+                        )
+                      }
+                      className="p-1.5 rounded-lg hover:bg-[var(--pc-hover)]"
+                      title={t("dashboard.open_in_chat")}
+                      style={{ color: "var(--pc-accent-light)" }}
+                    >
+                      <MessageSquareText className="h-4 w-4" />
+                    </button>
+                  )}
+                {renamingKey === session.session_key ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => void commitRename(session)}
+                      className="p-1.5 rounded-lg hover:bg-[var(--pc-hover)]"
+                      title={t("common.save")}
+                      style={{ color: "var(--pc-accent-light)" }}
+                    >
+                      <Check className="h-4 w-4" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={cancelRename}
+                      className="p-1.5 rounded-lg hover:bg-[var(--pc-hover)]"
+                      title={t("common.cancel")}
+                      style={{ color: "var(--pc-text-muted)" }}
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => startRename(session)}
+                    disabled={deleting === session.session_key}
+                    className="p-1.5 rounded-lg hover:bg-[var(--pc-hover)] disabled:opacity-50"
+                    title={t("dashboard.rename_session")}
+                    style={{ color: "var(--pc-text-muted)" }}
+                  >
+                    <Pencil className="h-4 w-4" />
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => openInspect(session)}
@@ -1341,11 +1487,19 @@ function SessionsTab() {
                   {t("dashboard.session_label")}
                 </p>
                 <p
-                  className="text-sm font-mono break-all"
+                  className={`text-sm break-all ${sessionTitleIsId(inspect.session) ? "font-mono" : ""}`}
                   style={{ color: "var(--pc-text-primary)" }}
                 >
-                  {inspect.session.session_id}
+                  {sessionDisplayTitle(inspect.session)}
                 </p>
+                {!sessionTitleIsId(inspect.session) && (
+                  <p
+                    className="text-xs font-mono break-all mt-0.5"
+                    style={{ color: "var(--pc-text-muted)" }}
+                  >
+                    {inspect.session.session_id}
+                  </p>
+                )}
                 <div className="flex items-center gap-2 mt-1 flex-wrap">
                   {inspect.session.agent_alias && (
                     <EntityLink
@@ -1728,9 +1882,13 @@ const TAB_IDS: TabId[] = [
   "cost",
 ];
 
+// Landing surface of the dashboard. Sessions comes first because a bare `/`
+// is most often opened to find a conversation, not to read system stats.
+const DEFAULT_TAB: TabId = "sessions";
+
 function parseTab(raw: string | null): TabId {
   if (raw && (TAB_IDS as string[]).includes(raw)) return raw as TabId;
-  return "overview";
+  return DEFAULT_TAB;
 }
 
 export default function Dashboard() {
@@ -1746,7 +1904,7 @@ export default function Dashboard() {
     setSearchParams(
       (prev) => {
         const next = new URLSearchParams(prev);
-        if (id === "overview") next.delete("tab");
+        if (id === DEFAULT_TAB) next.delete("tab");
         else next.set("tab", id);
         // Filters belong to specific tabs; drop them when leaving so deep
         // links don't drag a stale agent= into the wrong tab.
