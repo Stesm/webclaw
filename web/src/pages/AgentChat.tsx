@@ -242,9 +242,9 @@ export function AgentChatInner({
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, typing, streamingContent]);
 
-  // Re-key the mapped live-progress rows once per snapshot so React remounts
-  // them; the snapshot content (text/tool output) changes each poll under the
-  // same shape, and stable ids would otherwise hide the tool card update.
+  // Map the polled snapshot to live rows. `turnProgressToUiMessages` derives
+  // stable ids from the snapshot itself, so a poll that adds text or resolves a
+  // tool updates the existing rows in place instead of remounting them.
   const liveProgressUi = useMemo(
     () => (liveProgress ? turnProgressToUiMessages(liveProgress) : []),
     [liveProgress],

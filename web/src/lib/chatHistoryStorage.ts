@@ -1,5 +1,4 @@
 import type { SessionMessageRow, TurnProgress, WsAttachment } from '@/types/api';
-import { generateUUID } from '@/lib/uuid';
 
 const MAX_MESSAGES = 100;
 const PREFIX = 'zeroclaw_chat_history_v1:';
@@ -64,6 +63,13 @@ export function mapServerMessagesToPersisted(rows: SessionMessageRow[]): Persist
   const base = Date.now() - rows.length * 1000;
   const out: PersistedChatBubble[] = [];
   let idx = 0;
+  // Row identity must be a function of the row's position in the transcript,
+  // not of when it was mapped: a fresh UUID per mapping makes React remount
+  // every bubble on each rehydration (turn_done, reconnect), and the CSS
+  // entry animation replays the whole thread. Position is stable because the
+  // server returns the transcript in order.
+  let seq = 0;
+  const nextId = () => `srv:${seq++}`;
   for (const row of rows) {
     if (row.role === 'system') continue;
     const ts = new Date(base + idx * 1000).toISOString();
@@ -76,7 +82,7 @@ export function mapServerMessagesToPersisted(rows: SessionMessageRow[]): Persist
       if (results) {
         for (const [name, output] of results) {
           out.push({
-            id: generateUUID(),
+            id: nextId(),
             role: 'agent',
             content: '',
             markdown: false,
@@ -87,7 +93,7 @@ export function mapServerMessagesToPersisted(rows: SessionMessageRow[]): Persist
         continue;
       }
       out.push({
-        id: generateUUID(),
+        id: nextId(),
         role: 'user',
         content: row.content,
         timestamp: ts,
@@ -98,7 +104,7 @@ export function mapServerMessagesToPersisted(rows: SessionMessageRow[]): Persist
       const { prose, calls } = parsePersistedToolCalls(row.content);
       if (prose.trim()) {
         out.push({
-          id: generateUUID(),
+          id: nextId(),
           role: 'agent',
           content: prose,
           markdown: true,
@@ -109,7 +115,7 @@ export function mapServerMessagesToPersisted(rows: SessionMessageRow[]): Persist
         // A turn whose only visible output was a delivered file has no prose;
         // keep the bubble so the attachment survives reload.
         out.push({
-          id: generateUUID(),
+          id: nextId(),
           role: 'agent',
           content: '',
           markdown: false,
@@ -119,7 +125,7 @@ export function mapServerMessagesToPersisted(rows: SessionMessageRow[]): Persist
       }
       for (const [name, args] of calls) {
         out.push({
-          id: generateUUID(),
+          id: nextId(),
           role: 'agent',
           content: '',
           markdown: false,
@@ -129,7 +135,7 @@ export function mapServerMessagesToPersisted(rows: SessionMessageRow[]): Persist
       }
     } else {
       out.push({
-        id: generateUUID(),
+        id: nextId(),
         role: 'agent',
         content: row.content,
         markdown: false,
@@ -235,10 +241,17 @@ export function turnProgressToUiMessages(
     toolCall?: { name: string; args?: unknown; output?: string };
     timestamp: Date;
   }> = [];
-  for (const call of progress.tool_calls) {
+  // Deterministic ids: the snapshot is re-mapped on every poll while this pane
+  // watches a turn another connection owns, and React keys the live rows by
+  // `id`. A fresh UUID per snapshot would remount each bubble every tick and
+  // replay its entry animation, so a tool card is keyed by its gateway
+  // correlation id (falling back to its position for providers that send
+  // none), and the accumulated text by a stable literal. The snapshot only
+  // ever appends, so both stay stable as the turn grows.
+  for (const [i, call] of progress.tool_calls.entries()) {
     const hasOutput = call.output !== undefined && call.output !== null;
     out.push({
-      id: generateUUID(),
+      id: `live-tool:${call.id || `i${i}`}`,
       role: 'agent',
       content: '',
       markdown: false,
@@ -250,7 +263,7 @@ export function turnProgressToUiMessages(
   const text = progress.text.trim();
   if (text || thinking) {
     out.push({
-      id: generateUUID(),
+      id: 'live:text',
       role: 'agent',
       content: progress.text,
       thinking: thinking || undefined,
