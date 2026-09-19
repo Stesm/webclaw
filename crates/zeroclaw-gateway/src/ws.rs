@@ -1092,6 +1092,35 @@ fn has_assistant_chat_message(messages: &[zeroclaw_providers::ConversationMessag
     })
 }
 
+/// Whether `message` is the loop's synthesized bare interruption marker — the
+/// placeholder it commits when a cancel lands between rounds, before any
+/// assistant text was committed for that round.
+fn is_bare_interruption_marker(
+    message: &zeroclaw_providers::ConversationMessage,
+    marker: &str,
+) -> bool {
+    matches!(
+        message,
+        zeroclaw_providers::ConversationMessage::Chat(message)
+            if message.role == "assistant" && message.content.trim() == marker
+    )
+}
+
+/// Whether any committed assistant message already carries the visible text the
+/// operator watched stream in, so a cancel fallback does not duplicate it.
+fn has_visible_assistant_text(
+    messages: &[zeroclaw_providers::ConversationMessage],
+    visible: &str,
+) -> bool {
+    messages.iter().any(|message| {
+        matches!(
+            message,
+            zeroclaw_providers::ConversationMessage::Chat(message)
+                if message.role == "assistant" && message.content.contains(visible)
+        )
+    })
+}
+
 /// Assistant text to persist for a turn that ended in an error, or `None` when
 /// there is nothing worth adding.
 ///
@@ -1718,58 +1747,63 @@ async fn process_chat_message(
     };
 
     if was_cancelled {
-        if let Some(ref backend) = state.session_backend {
-            let still_exists = backend.session_exists(session_key);
-            if still_exists {
-                match &result {
-                    Err(error) if !error.new_messages.is_empty() => {
-                        persist_conversation_messages(
-                            backend.as_ref(),
+        if let Some(ref backend) = state.session_backend
+            && backend.session_exists(session_key)
+        {
+            let marker =
+                zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user");
+            // What the operator watched stream in this turn. A cancel that
+            // lands between rounds leaves only a bare marker in `new_messages`
+            // even though narration was delivered live during an earlier tool
+            // round, so the visible text is the fallback that keeps it.
+            let visible = accumulated_text.trim();
+
+            match &result {
+                Err(error) if !error.new_messages.is_empty() => {
+                    // Drop the loop's bare marker when the visible text can
+                    // replace it; persisting both would show the marker twice.
+                    let messages: Vec<zeroclaw_providers::ConversationMessage> = error
+                        .new_messages
+                        .iter()
+                        .filter(|message| {
+                            visible.is_empty() || !is_bare_interruption_marker(message, &marker)
+                        })
+                        .cloned()
+                        .collect();
+                    persist_conversation_messages(
+                        backend.as_ref(),
+                        session_key,
+                        &messages,
+                        &turn_attachments,
+                    );
+                    // Re-check before the raw append — the user can delete the
+                    // session between the outer check and here;
+                    // `persist_conversation_messages` already re-checks
+                    // internally.
+                    if !visible.is_empty()
+                        && !has_visible_assistant_text(&messages, visible)
+                        && backend.session_exists(session_key)
+                    {
+                        let truncated = format!("{visible}\n\n{marker}");
+                        let _ = backend.append_with_attachments(
                             session_key,
-                            &error.new_messages,
+                            &zeroclaw_providers::ChatMessage::assistant(&truncated),
                             &turn_attachments,
                         );
-                        if !has_assistant_chat_message(&error.new_messages) {
-                            let marker = zeroclaw_runtime::i18n::get_required_cli_string(
-                                "turn-interrupted-by-user",
-                            );
-                            let truncated = if accumulated_text.is_empty() {
-                                marker
-                            } else {
-                                format!("{accumulated_text}\n\n{marker}")
-                            };
-                            let assistant_msg =
-                                zeroclaw_providers::ChatMessage::assistant(&truncated);
-                            // Re-check before the raw append — the user can
-                            // delete the session between the outer check and
-                            // here; `persist_conversation_messages` already
-                            // re-checks internally.
-                            if backend.session_exists(session_key) {
-                                let _ = backend.append_with_attachments(
-                                    session_key,
-                                    &assistant_msg,
-                                    &turn_attachments,
-                                );
-                            }
-                        }
                     }
-                    _ => {
-                        let marker = zeroclaw_runtime::i18n::get_required_cli_string(
-                            "turn-interrupted-by-user",
+                }
+                _ => {
+                    let truncated = if accumulated_text.is_empty() {
+                        marker
+                    } else {
+                        format!("{accumulated_text}\n\n{marker}")
+                    };
+                    if backend.session_exists(session_key) {
+                        let _ = backend.append_with_attachments(
+                            session_key,
+                            &zeroclaw_providers::ChatMessage::assistant(&truncated),
+                            &turn_attachments,
                         );
-                        let truncated = if accumulated_text.is_empty() {
-                            marker
-                        } else {
-                            format!("{accumulated_text}\n\n{marker}")
-                        };
-                        let assistant_msg = zeroclaw_providers::ChatMessage::assistant(&truncated);
-                        if backend.session_exists(session_key) {
-                            let _ = backend.append_with_attachments(
-                                session_key,
-                                &assistant_msg,
-                                &turn_attachments,
-                            );
-                        }
                     }
                 }
             }
@@ -3175,6 +3209,56 @@ data: {\"type\":\"message_stop\"}\n\n",
             None
         );
         assert_eq!(error_turn_partial_assistant_text(&messages, "", ""), None);
+    }
+
+    // ── Cancel-turn partial persistence ─────────────────────────────
+
+    #[test]
+    fn bare_interruption_marker_matches_only_the_synthesized_placeholder() {
+        use zeroclaw_providers::{ChatMessage, ConversationMessage};
+
+        let marker = zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user");
+
+        assert!(is_bare_interruption_marker(
+            &ConversationMessage::Chat(ChatMessage::assistant(&marker)),
+            &marker
+        ));
+        assert!(
+            is_bare_interruption_marker(
+                &ConversationMessage::Chat(ChatMessage::assistant(format!("  {marker}\n"))),
+                &marker
+            ),
+            "whitespace around the placeholder is still the bare marker"
+        );
+        assert!(
+            !is_bare_interruption_marker(
+                &ConversationMessage::Chat(ChatMessage::assistant(format!(
+                    "narration\n\n{marker}"
+                ))),
+                &marker
+            ),
+            "a partial carrying real text must survive the filter"
+        );
+        assert!(
+            !is_bare_interruption_marker(
+                &ConversationMessage::Chat(ChatMessage::user(&marker)),
+                &marker
+            ),
+            "only assistant messages can be the loop's placeholder"
+        );
+    }
+
+    #[test]
+    fn has_visible_assistant_text_detects_the_committed_partial() {
+        use zeroclaw_providers::{ChatMessage, ConversationMessage};
+
+        let messages = vec![
+            ConversationMessage::Chat(ChatMessage::user("hi")),
+            ConversationMessage::Chat(ChatMessage::assistant("draft\n\n[interrupted by user]")),
+        ];
+
+        assert!(has_visible_assistant_text(&messages, "draft"));
+        assert!(!has_visible_assistant_text(&messages, "something else"));
     }
 
     /// A `Sink<Message>` that just collects the text frames sent to it, so a handler
