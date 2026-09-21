@@ -1282,9 +1282,11 @@ export function AgentProvider({
    * connection and reconnects with the new id, and the hydration effect pulls
    * that conversation's transcript — so nothing here touches either directly.
    *
-   * A turn streaming in the outgoing conversation is aborted first: the socket
-   * is going away regardless, and leaving it running would keep executing tools
-   * against a session the operator has navigated away from.
+   * A turn still streaming in the outgoing conversation is deliberately left
+   * running: the gateway keeps it alive after the socket closes, so switching
+   * away and back must not cancel the operator's in-flight work. The reply is
+   * persisted server-side and rehydrated on return (see the `turn_done`
+   * broadcast path). Aborting here would surface as `[interrupted by user]`.
    */
   const transitionToSession = useCallback((nextSessionId: string, force = false): boolean => {
     const currentSessionId = activeSessionIdRef.current;
@@ -1294,12 +1296,6 @@ export function AgentProvider({
     // forced caller is a completed delete whose target is now active: that
     // conversation no longer exists, so staying put is not a valid fallback.
     if (!force && sessionPersistenceRef.current !== true) return false;
-
-    if (typingRef.current) {
-      void abortSession(currentSessionId).catch(() => {
-        // Best-effort: never block the switch on a failed abort.
-      });
-    }
 
     resetTranscriptState();
     // Invalidate the hydration marker in the same batch. Without it, switching

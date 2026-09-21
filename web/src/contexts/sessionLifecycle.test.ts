@@ -69,6 +69,10 @@ let configPutCalls: ConfigPutRequest[] = [];
 let missingSessions = new Set<string>();
 let deleteFailures = new Set<string>();
 let configPutHandler: ((request: ConfigPutRequest) => Promise<Response>) | null = null;
+// Session ids a switch/model change aborted server-side. A session switch must
+// NOT appear here: the gateway keeps an in-flight turn alive across the socket
+// close, so aborting on navigation would surface as `[interrupted by user]`.
+let abortCalls: string[] = [];
 
 globalThis.fetch = async (input, init) => {
   const url = typeof input === 'string'
@@ -90,6 +94,11 @@ globalThis.fetch = async (input, init) => {
     // `sessionsResponder` lets a test control when each listing resolves, so
     // out-of-order list responses can be reproduced deterministically.
     body = { sessions: sessionsResponder ? await sessionsResponder() : listedSessions };
+  }
+  else if (/\/api\/sessions\/[^/]+\/abort$/.test(url) && init?.method === 'POST') {
+    const id = decodeURIComponent(url.slice(url.lastIndexOf('/api/sessions/') + '/api/sessions/'.length, url.lastIndexOf('/abort')));
+    abortCalls.push(id);
+    body = { status: 'aborted' };
   }
   else if (/\/api\/sessions\/[^/]+$/.test(url) && init?.method === 'DELETE') {
     // The gateway's real DELETE contract: a plain `{"error": ...}` body, not
@@ -352,6 +361,7 @@ beforeEach(() => {
   deleteFailures = new Set();
   configPutHandler = null;
   sessionsResponder = null;
+  abortCalls = [];
   storage.setItem('zeroclaw_active_session.ops', 'A');
   listedSessions = [
     {
@@ -488,6 +498,32 @@ test('a conversation another pane owns can be neither opened nor deleted here', 
     .find((button) => button.props['aria-label'] === 'Delete conversation: First');
   assert.equal(freeDelete?.props.disabled, false);
 
+  await unmount(mounted.renderer);
+});
+
+test('switching away from a streaming conversation does not abort its turn', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  runtime.queueMessages('B', () => Promise.resolve(messagesResponse('B', true)));
+  const mounted = await mountChat(runtime);
+  await openSocket(runtime, 0);
+  await settle();
+
+  // A turn is live in A (a streamed chunk flips `typing`).
+  await act(async () => { mounted.context().sendMessage('long running task'); });
+  await act(async () => {
+    runtime.sockets[0]!.emitMessage({ type: 'chunk', content: 'working' });
+  });
+  await settle();
+  assert.equal(mounted.context().typing, true);
+
+  assert.equal(await goToSession(mounted, 'B'), true);
+  await settle();
+
+  // The gateway keeps the turn alive across the socket close, so navigation
+  // must not cancel it — an abort here renders as `[interrupted by user]`.
+  assert.deepEqual(abortCalls, []);
+  assert.equal(mounted.context().sessionId, 'B');
   await unmount(mounted.renderer);
 });
 
