@@ -3,6 +3,7 @@ import type {
   ToolSpec,
   CronJob,
   CronRun,
+  CronRunLogResponse,
   Integration,
   DiagResult,
   MemoryEntry,
@@ -2024,6 +2025,13 @@ export function getCronRuns(
     const result = unwrapField(data, "runs");
     return Array.isArray(result) ? result : [];
   });
+}
+
+/** Current or most recent run transcript for a cron job, polled live. */
+export function getCronRunLog(jobId: string): Promise<CronRunLogResponse> {
+  return apiFetch<CronRunLogResponse>(
+    `/api/cron/${encodeURIComponent(jobId)}/log`,
+  );
 }
 
 export interface CronSettings {

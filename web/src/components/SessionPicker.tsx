@@ -4,6 +4,7 @@ import { useAgent } from '@/contexts/AgentContext';
 import { getSessions } from '@/lib/api';
 import { formatRelative } from '@/lib/format';
 import { t } from '@/lib/i18n';
+import SessionViewerModal from '@/components/SessionViewerModal';
 
 /**
  * One row of the picker. Deliberately not the API `Session` shape: the active
@@ -13,11 +14,15 @@ import { t } from '@/lib/i18n';
 interface SessionRow {
   /** Bare session id — what `/ws/chat`, rename and abort all take. */
   id: string;
+  /** Full storage key, for read-only viewing of non-gateway sessions. */
+  key: string;
   name?: string;
   messageCount: number;
   lastActivity: string | null;
   /** False for the active conversation before its first persisted turn. */
   persisted: boolean;
+  /** Gateway web-chat sessions are openable; channel sessions are view-only. */
+  openable: boolean;
 }
 
 function rowLabel(row: SessionRow): string {
@@ -71,6 +76,9 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
   const [renameFailed, setRenameFailed] = useState(false);
   const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
   const [deleteFailed, setDeleteFailed] = useState(false);
+  // Channel sessions are read-only here: the picker lists them so the operator
+  // can find the conversation, and this opens its transcript without a socket.
+  const [viewing, setViewing] = useState<SessionRow | null>(null);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -94,25 +102,20 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
       const all = await getSessions();
       if (superseded()) return;
       const mine = all
-        // Gateway web-chat sessions only, keyed on the storage prefix rather
-        // than merely "has no channel": the TUI's chat pane stores sessions as
-        // `rpc_<id>` with this same alias stamped and no channel_id, so an
-        // absence check would list terminal conversations here. It matters
-        // beyond tidiness — every action in this menu addresses a session by
-        // its bare `session_id`, and only a `gw_` key round-trips that way
-        // through /ws/chat, rename, abort, messages and delete.
-        .filter(
-          (s) =>
-            s.session_key.startsWith('gw_') &&
-            s.channel_id === null &&
-            s.agent_alias === agentAlias,
-        )
+        // Every session this agent owns. Gateway web-chat sessions are
+        // openable here; channel sessions (Mattermost and friends) are listed
+        // read-only — they are not keyed for `/ws/chat`, so opening one would
+        // mint a fresh empty gateway session instead of showing it. `rpc_`
+        // sessions are the terminal pane's and are excluded by channel_id.
+        .filter((s) => s.agent_alias === agentAlias)
         .map<SessionRow>((s) => ({
           id: s.session_id,
+          key: s.session_key,
           name: s.name,
           messageCount: s.message_count,
           lastActivity: s.last_activity,
           persisted: true,
+          openable: s.session_key.startsWith('gw_') && s.channel_id === null,
         }))
         .sort((a, b) => (b.lastActivity ?? '').localeCompare(a.lastActivity ?? ''));
 
@@ -123,16 +126,18 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
       if (!mine.some((row) => row.id === sessionId)) {
         mine.unshift({
           id: sessionId,
+          key: `gw_${sessionId}`,
           messageCount: 0,
           lastActivity: null,
           persisted: false,
+          openable: true,
         });
       }
       setRows(mine);
     } catch {
       if (superseded()) return;
       setLoadFailed(true);
-      setRows([{ id: sessionId, messageCount: 0, lastActivity: null, persisted: false }]);
+      setRows([{ id: sessionId, key: `gw_${sessionId}`, messageCount: 0, lastActivity: null, persisted: false, openable: true }]);
     } finally {
       // A superseded load must not clear the spinner a newer one is still owed.
       if (!superseded()) setLoading(false);
@@ -201,17 +206,24 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
     if (startNewSession()) closeMenuAndRefocus();
   }, [startNewSession, closeMenuAndRefocus]);
 
-  const handleSelect = useCallback((id: string) => {
+  const handleSelect = useCallback((row: SessionRow) => {
+    // Channel sessions have no `/ws/chat` route: opening one would create a new
+    // gateway session instead of showing it. Surface the transcript read-only.
+    if (!row.openable) {
+      setViewing(row);
+      closeMenu();
+      return;
+    }
     // Exclusive ownership is enforced here, not only by the row's `disabled`
     // attribute: styling is one refactor away from being lost, and taking a
     // conversation a sibling pane is live on would put two sockets on one
     // gateway session.
-    if (reserved.has(id)) return;
+    if (reserved.has(row.id)) return;
     // Selecting the row already on screen is still a completed picker action.
     // goToSession correctly reports false for that no-op, but the menu should
     // dismiss just as it does after selecting a different conversation.
-    if (id === sessionId || goToSession(id)) closeMenuAndRefocus();
-  }, [reserved, sessionId, goToSession, closeMenuAndRefocus]);
+    if (row.id === sessionId || goToSession(row.id)) closeMenuAndRefocus();
+  }, [reserved, sessionId, goToSession, closeMenuAndRefocus, closeMenu]);
 
   const commitRename = useCallback(async (id: string) => {
     const name = renameDraft.trim();
@@ -418,12 +430,12 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
               >
                 <button
                   type="button"
-                  onClick={() => handleSelect(row.id)}
-                  // Two independent reasons a row cannot be opened: another pane
-                  // already owns that conversation, or this agent cannot persist
-                  // conversations so there is no route back to the live one.
-                  disabled={takenElsewhere || (!isActive && !storesConversations)}
-                  title={takenElsewhere ? t('agent.session_open_elsewhere') : undefined}
+                  onClick={() => handleSelect(row)}
+                  // An openable row is disabled when another pane owns it, or
+                  // when this agent cannot persist conversations so there is no
+                  // route back. Channel rows are view-only and always openable.
+                  disabled={row.openable && (takenElsewhere || (!isActive && !storesConversations))}
+                  title={row.openable && takenElsewhere ? t('agent.session_open_elsewhere') : undefined}
                   className="flex-1 min-w-0 text-left px-3 py-2 disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   <span
@@ -440,11 +452,9 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
                   </span>
                 </button>
 
-                {/* Rename and delete only exist server-side, and the row
-                    actions stay visible on touch, where there is no hover to
-                    reveal them (opacity alone would leave them tappable but
-                    invisible). */}
-                {storesConversations && (
+                {/* Rename and delete only exist server-side, and only for
+                    gateway sessions whose bare id round-trips through the API. */}
+                {storesConversations && row.openable && (
                   <>
                     <button
                       type="button"
@@ -487,6 +497,14 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
             );
           })}
         </div>
+      )}
+
+      {viewing && (
+        <SessionViewerModal
+          sessionKey={viewing.key}
+          title={rowLabel(viewing)}
+          onClose={() => setViewing(null)}
+        />
       )}
     </div>
   );

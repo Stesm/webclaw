@@ -16,11 +16,13 @@ import { t } from '@/lib/i18n';
 import { Badge, Button, Card, PageHeader } from '@/components/ui';
 import ToolPicker from '@/components/ToolPicker';
 import type { CronJob, CronRun } from '@/types/api';
+import SessionViewerModal from '@/components/SessionViewerModal';
 import {
   AlertCircle,
   CheckCircle,
   ChevronDown,
   Clock,
+  FileText,
   Pause,
   Pencil,
   Play,
@@ -194,6 +196,8 @@ export default function Cron() {
   const [runHistoryRefresh, setRunHistoryRefresh] = useState<Record<string, number>>({});
   const [settings, setSettings] = useState<CronSettings | null>(null);
   const [togglingCatchUp, setTogglingCatchUp] = useState(false);
+  // Cron job whose live/latest run transcript is open in the viewer.
+  const [logJob, setLogJob] = useState<CronJob | null>(null);
 
   // Unified modal: null = closed, 'add' = adding, CronJob = editing
   const [modalJob, setModalJob] = useState<CronJob | 'add' | null>(null);
@@ -1105,6 +1109,17 @@ export default function Cron() {
                             <Play className="h-4 w-4" />
                           )}
                         </Button>
+                        {job.job_type === 'agent' && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => setLogJob(job)}
+                            title={t('cron.view_log')}
+                            aria-label={t('cron.view_log')}
+                          >
+                            <FileText className="h-4 w-4" />
+                          </Button>
+                        )}
                         <Button
                           variant="ghost"
                           size="sm"
@@ -1176,6 +1191,14 @@ export default function Cron() {
             </tbody>
           </table>
         </Card>
+      )}
+
+      {logJob && (
+        <SessionViewerModal
+          cronJobId={logJob.id}
+          title={logJob.name ?? logJob.id}
+          onClose={() => setLogJob(null)}
+        />
       )}
     </div>
   );

@@ -348,6 +348,21 @@ export interface SessionMessagesResponse {
   in_progress?: TurnProgress | null;
 }
 
+/** One entry in a cron run transcript (`GET /api/cron/{id}/log`). */
+export type CronRunLogMessage =
+  | { type: 'user'; content: string }
+  | { type: 'assistant'; content: string }
+  | { type: 'tool'; id: string; name: string; args: unknown; output: string | null };
+
+/** Current or most recent run transcript for a cron job. */
+export interface CronRunLogResponse {
+  job_id: string;
+  status: string;
+  started_at: string;
+  finished_at: string | null;
+  messages: CronRunLogMessage[];
+}
+
 export interface TuiEntry {
   tui_id: string;
   connected_at: string;
