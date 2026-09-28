@@ -2080,6 +2080,7 @@ pub async fn run_gateway_with_plugin_webhooks(
             delete(api::handle_api_cron_delete).patch(api::handle_api_cron_patch),
         )
         .route("/api/cron/{id}/runs", get(api::handle_api_cron_runs))
+        .route("/api/cron/{id}/log", get(api::handle_api_cron_log))
         // Note: `/api/cron/{id}/run` is registered on a separate router below
         // with a longer TimeoutLayer — manual cron triggers run the job
         // synchronously and routinely exceed the 30s gateway-wide default.

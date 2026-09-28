@@ -190,6 +190,9 @@ impl Tool for SpawnSubagentTool {
             // the correct choice. The daemon heartbeat worker is the
             // only `mcp_registry` supplier.
             mcp_registry: None,
+            // Subagent transcripts are not surfaced live; no event tap.
+            event_tx: None,
+            force_buffered_provider: false,
         };
         let parent_alias = subagent_ctx.parent_alias.clone();
 

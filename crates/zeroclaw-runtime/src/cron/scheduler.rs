@@ -594,6 +594,78 @@ fn cron_agent_session_path(target: &SessionTarget, run_session_id: &str) -> std:
     }
 }
 
+/// Path of the live transcript file for one cron job. A single file per job is
+/// overwritten by each run, so a viewer always reads the current or most
+/// recent run without a run-id handshake.
+fn cron_run_log_path(config: &Config, job_id: &str) -> std::path::PathBuf {
+    config
+        .data_dir
+        .join("state")
+        .join("cron-runs")
+        .join(format!("{job_id}.json"))
+}
+
+/// Read the current or most recent run transcript for one cron job.
+pub fn read_job_run_log(
+    config: &Config,
+    job_id: &str,
+) -> Result<Option<crate::agent::history::CronRunLog>> {
+    crate::agent::history::load_cron_run_log(&cron_run_log_path(config, job_id))
+}
+
+/// Rewrite the transcript file on a throttle while the run streams. Draining
+/// is best-effort: a slow viewer write never backpressures the agent loop.
+/// The builder is shared so the scheduler can commit the final snapshot once
+/// it knows the run's terminal status.
+fn spawn_cron_run_logger(
+    path: std::path::PathBuf,
+    started_at: DateTime<Utc>,
+    mut rx: tokio::sync::mpsc::Receiver<zeroclaw_api::agent::TurnEvent>,
+    builder: Arc<parking_lot::Mutex<crate::agent::history::CronRunLogBuilder>>,
+) -> tokio::task::JoinHandle<()> {
+    zeroclaw_spawn::spawn!(async move {
+        let started = started_at.to_rfc3339();
+        let mut dirty = false;
+        let mut ticker = time::interval(Duration::from_millis(1000));
+        ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                event = rx.recv() => match event {
+                    Some(event) => {
+                        builder.lock().apply(&event);
+                        dirty = true;
+                        if matches!(event, zeroclaw_api::agent::TurnEvent::ToolResult { .. }) {
+                            dirty = false;
+                            let snapshot = builder.lock().snapshot();
+                            let _ = crate::agent::history::save_cron_run_log(
+                                &path,
+                                "running",
+                                &started,
+                                None,
+                                &snapshot,
+                            );
+                        }
+                    }
+                    None => break,
+                },
+                _ = ticker.tick() => {
+                    if dirty {
+                        dirty = false;
+                        let snapshot = builder.lock().snapshot();
+                        let _ = crate::agent::history::save_cron_run_log(
+                            &path,
+                            "running",
+                            &started,
+                            None,
+                            &snapshot,
+                        );
+                    }
+                }
+            }
+        }
+    })
+}
+
 async fn execute_job_with_retry(
     config: &Config,
     security: &SecurityPolicy,
@@ -844,6 +916,26 @@ async fn run_agent_job(
     );
 
     let run_security = cron_agent_run_policy(security, job);
+    let run_started_at = Utc::now();
+    let log_path = cron_run_log_path(config, &job.id);
+    let log_builder = Arc::new(parking_lot::Mutex::new(
+        crate::agent::history::CronRunLogBuilder::new(&prefixed_prompt),
+    ));
+    let (log_tx, log_rx) = tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
+    let log_started = run_started_at.to_rfc3339();
+    let _ = crate::agent::history::save_cron_run_log(
+        &log_path,
+        "running",
+        &log_started,
+        None,
+        &log_builder.lock().snapshot(),
+    );
+    let log_task = spawn_cron_run_logger(
+        log_path.clone(),
+        run_started_at,
+        log_rx,
+        Arc::clone(&log_builder),
+    );
     let run_overrides = crate::agent::loop_::AgentRunOverrides {
         security: Some(Arc::new(run_security)),
         memory: None,
@@ -861,6 +953,8 @@ async fn run_agent_job(
         // `agent::run` is the correct choice. The daemon heartbeat
         // worker is the only `mcp_registry` supplier.
         mcp_registry: None,
+        event_tx: Some(log_tx),
+        force_buffered_provider: true,
     };
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
@@ -887,7 +981,7 @@ async fn run_agent_job(
         }
     };
 
-    match run_result {
+    let (success, output) = match run_result {
         Ok(response) => (
             true,
             if response.trim().is_empty() {
@@ -916,7 +1010,20 @@ async fn run_agent_job(
             }
             (false, format!("agent job failed: {e}"))
         }
-    }
+    };
+
+    // Drain the event consumer, then commit the terminal transcript. The log
+    // task only ever writes "running"; the terminal status is owned here.
+    let _ = log_task.await;
+    let _ = crate::agent::history::save_cron_run_log(
+        &log_path,
+        if success { "ok" } else { "error" },
+        &log_started,
+        Some(&Utc::now().to_rfc3339()),
+        &log_builder.lock().snapshot(),
+    );
+
+    (success, output)
 }
 
 async fn persist_job_result(

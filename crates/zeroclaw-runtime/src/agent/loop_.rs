@@ -1097,6 +1097,15 @@ pub struct AgentRunOverrides {
     /// (CLI / one-shot), which is correct for callers that have no
     /// cross-turn reuse contract.
     pub mcp_registry: Option<Arc<crate::tools::McpRegistry>>,
+    /// Live `TurnEvent` stream for the single-shot path. The cron scheduler
+    /// taps this to rewrite a per-job transcript file as the run progresses,
+    /// so the dashboard can render the current run before it finishes.
+    /// `None` preserves the buffered behavior every other caller gets.
+    pub event_tx: Option<tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
+    /// Keep provider calls buffered even when `event_tx` is attached. Set with
+    /// `event_tx` by the cron transcript tap: it wants the event stream but
+    /// must not switch the job's provider transport to streaming.
+    pub force_buffered_provider: bool,
 }
 
 fn agent_provider_composite(
@@ -1967,7 +1976,11 @@ pub async fn run(
                                         context_token_budget: agent
                                             .resolved
                                             .effective_context_budget(),
-                                        knobs: &LoopKnobs::default(),
+                                        knobs: &LoopKnobs {
+                                            force_buffered_provider: overrides
+                                                .force_buffered_provider,
+                                            ..LoopKnobs::default()
+                                        },
                                     },
                                 ),
                                 history: &mut history,
@@ -1978,7 +1991,7 @@ pub async fn run(
                                 shared_budget: None,
                                 channel: None,
                                 collected_receipts: None,
-                                event_tx: None,
+                                event_tx: overrides.event_tx.clone(),
                                 steering: None,
                                 new_messages_out: None,
                                 image_cache: None,

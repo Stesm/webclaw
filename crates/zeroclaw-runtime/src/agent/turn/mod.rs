@@ -864,6 +864,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         let active_provider_supports_streaming_tool_events =
             active_model_provider.supports_streaming_tool_events();
         let should_consume_provider_stream = (on_delta.is_some() || event_tx.is_some())
+            && !knobs.force_buffered_provider
             && active_provider_supports_streaming
             && (request_tools.is_none() || active_provider_supports_streaming_tool_events);
         if ::zeroclaw_log::debug_enabled() {

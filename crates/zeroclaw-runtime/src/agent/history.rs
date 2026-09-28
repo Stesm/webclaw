@@ -510,6 +510,253 @@ pub fn save_interactive_session_history(path: &Path, history: &[ChatMessage]) ->
     Ok(())
 }
 
+/// Live transcript of one cron agent run, rewritten in place as the run
+/// progresses so a viewer can read the current or most recent run from a
+/// single file per job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CronRunLog {
+    pub version: u32,
+    pub status: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub messages: Vec<CronRunMessage>,
+}
+
+/// One entry in a [`CronRunLog`]. Structured rather than the internal
+/// `ChatMessage` encoding so the dashboard renders it without parsing
+/// protocol tags.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CronRunMessage {
+    User {
+        content: String,
+    },
+    Assistant {
+        content: String,
+    },
+    Tool {
+        id: String,
+        name: String,
+        args: serde_json::Value,
+        output: Option<String>,
+    },
+}
+
+/// Accumulates the live `TurnEvent` stream for one cron run into a
+/// [`CronRunLog`] message list.
+#[derive(Debug, Default)]
+pub struct CronRunLogBuilder {
+    messages: Vec<CronRunMessage>,
+    pending_text: String,
+}
+
+impl CronRunLogBuilder {
+    pub fn new(user_prompt: &str) -> Self {
+        Self {
+            messages: vec![CronRunMessage::User {
+                content: user_prompt.to_string(),
+            }],
+            pending_text: String::new(),
+        }
+    }
+
+    pub fn apply(&mut self, event: &zeroclaw_api::agent::TurnEvent) {
+        use zeroclaw_api::agent::TurnEvent;
+        match event {
+            TurnEvent::Chunk { delta } => self.pending_text.push_str(delta),
+            TurnEvent::ToolCall { id, name, args } => {
+                self.commit_text();
+                self.messages.push(CronRunMessage::Tool {
+                    id: id.clone(),
+                    name: name.clone(),
+                    args: args.clone(),
+                    output: None,
+                });
+            }
+            TurnEvent::ToolResult { id, output, .. } => {
+                if let Some(CronRunMessage::Tool { output: slot, .. }) =
+                    self.messages.iter_mut().rev().find(|msg| {
+                        matches!(msg, CronRunMessage::Tool { id: existing, output: None, .. } if existing == id)
+                    })
+                {
+                    *slot = Some(output.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn commit_text(&mut self) {
+        if self.pending_text.is_empty() {
+            return;
+        }
+        self.messages.push(CronRunMessage::Assistant {
+            content: std::mem::take(&mut self.pending_text),
+        });
+    }
+
+    /// Snapshot for a periodic write: committed messages plus the in-progress
+    /// assistant text, so a viewer sees streaming output before the next tool.
+    /// The final write uses this too: a trailing assistant message is exactly
+    /// what an unfinished text buffer should render as.
+    pub fn snapshot(&self) -> Vec<CronRunMessage> {
+        let mut out = self.messages.clone();
+        if !self.pending_text.is_empty() {
+            out.push(CronRunMessage::Assistant {
+                content: self.pending_text.clone(),
+            });
+        }
+        out
+    }
+}
+
+pub fn save_cron_run_log(
+    path: &Path,
+    status: &str,
+    started_at: &str,
+    finished_at: Option<&str>,
+    messages: &[CronRunMessage],
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let payload = serde_json::to_string_pretty(&CronRunLog {
+        version: 1,
+        status: status.to_string(),
+        started_at: started_at.to_string(),
+        finished_at: finished_at.map(str::to_string),
+        messages: messages.to_vec(),
+    })?;
+    std::fs::write(path, payload)?;
+    Ok(())
+}
+
+pub fn load_cron_run_log(path: &Path) -> Result<Option<CronRunLog>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(path)?;
+    Ok(Some(serde_json::from_str(&raw)?))
+}
+
+#[cfg(test)]
+mod cron_run_log_tests {
+    use super::*;
+    use zeroclaw_api::agent::TurnEvent;
+
+    #[test]
+    fn builder_interleaves_text_and_tool_calls() {
+        let mut builder = CronRunLogBuilder::new("do work");
+        builder.apply(&TurnEvent::Chunk {
+            delta: "thinking".into(),
+        });
+        builder.apply(&TurnEvent::ToolCall {
+            id: "1".into(),
+            name: "shell".into(),
+            args: serde_json::json!({"command": "ls"}),
+        });
+        builder.apply(&TurnEvent::ToolResult {
+            id: "1".into(),
+            name: "shell".into(),
+            output: "file.txt".into(),
+            artifact: None,
+        });
+        builder.apply(&TurnEvent::Chunk {
+            delta: "done".into(),
+        });
+
+        let messages = builder.snapshot();
+        assert_eq!(messages.len(), 4);
+        assert_eq!(
+            messages[0],
+            CronRunMessage::User {
+                content: "do work".into()
+            }
+        );
+        assert_eq!(
+            messages[1],
+            CronRunMessage::Assistant {
+                content: "thinking".into()
+            }
+        );
+        match &messages[2] {
+            CronRunMessage::Tool {
+                id, name, output, ..
+            } => {
+                assert_eq!(id, "1");
+                assert_eq!(name, "shell");
+                assert_eq!(output.as_deref(), Some("file.txt"));
+            }
+            other => panic!("expected tool message, got {other:?}"),
+        }
+        assert_eq!(
+            messages[3],
+            CronRunMessage::Assistant {
+                content: "done".into()
+            }
+        );
+    }
+
+    #[test]
+    fn snapshot_includes_pending_text_without_committing() {
+        let mut builder = CronRunLogBuilder::new("prompt");
+        builder.apply(&TurnEvent::Chunk {
+            delta: "partial".into(),
+        });
+        assert_eq!(builder.snapshot().len(), 2);
+        assert_eq!(builder.snapshot().len(), 2, "snapshot must not commit");
+        assert!(matches!(
+            builder.snapshot().last(),
+            Some(CronRunMessage::Assistant { content }) if content == "partial"
+        ));
+    }
+
+    #[test]
+    fn save_and_load_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("zc-cron-log-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("job.json");
+        let messages = vec![
+            CronRunMessage::User {
+                content: "hi".into(),
+            },
+            CronRunMessage::Assistant {
+                content: "yo".into(),
+            },
+        ];
+        save_cron_run_log(
+            &path,
+            "ok",
+            "2026-01-01T00:00:00Z",
+            Some("2026-01-01T00:01:00Z"),
+            &messages,
+        )
+        .unwrap();
+        let log = load_cron_run_log(&path).unwrap().unwrap();
+        assert_eq!(log.status, "ok");
+        assert_eq!(log.finished_at.as_deref(), Some("2026-01-01T00:01:00Z"));
+        assert_eq!(log.messages, messages);
+        assert!(
+            load_cron_run_log(&dir.join("missing.json"))
+                .unwrap()
+                .is_none()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tool_result_with_no_pending_call_is_ignored() {
+        let mut builder = CronRunLogBuilder::new("prompt");
+        builder.apply(&TurnEvent::ToolResult {
+            id: "orphan".into(),
+            name: "shell".into(),
+            output: "out".into(),
+            artifact: None,
+        });
+        assert_eq!(builder.snapshot().len(), 1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

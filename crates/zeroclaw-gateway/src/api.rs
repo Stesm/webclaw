@@ -638,6 +638,49 @@ pub async fn handle_api_cron_runs(
 }
 
 /// POST /api/cron/:id/run — trigger a cron job manually
+/// GET /api/cron/:id/log — current or most recent run transcript
+pub async fn handle_api_cron_log(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.read().clone();
+
+    if let Err(e) = zeroclaw_runtime::cron::get_job(&config, &id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("Cron job not found: {e}")})),
+        )
+            .into_response();
+    }
+
+    match zeroclaw_runtime::cron::scheduler::read_job_run_log(&config, &id) {
+        Ok(Some(log)) => Json(serde_json::json!({
+            "job_id": id,
+            "status": log.status,
+            "started_at": log.started_at,
+            "finished_at": log.finished_at,
+            "messages": log.messages,
+        }))
+        .into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "No run log for this cron job yet"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to read cron run log: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/cron/:id/run — trigger a cron job manually
 pub async fn handle_api_cron_run(
     State(state): State<AppState>,
     headers: HeaderMap,

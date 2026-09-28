@@ -22,6 +22,12 @@ pub struct LoopKnobs {
     /// draft/status surface. Raw reasoning is opt-in; the default only emits a
     /// liveness tick so existing channel progress remains privacy-preserving.
     pub draft_reasoning: StreamReasoningMode,
+    /// Keep provider calls buffered even when an `event_tx` tap is attached.
+    /// Turn events (tool calls/results, post-hoc text) still fire, so a viewer
+    /// sees progress; only token-by-token streaming is suppressed. Set by the
+    /// cron transcript tap, which wants the event stream but must not change
+    /// the job's provider transport.
+    pub force_buffered_provider: bool,
 }
 
 impl Default for LoopKnobs {
@@ -31,6 +37,7 @@ impl Default for LoopKnobs {
             max_iteration_behavior: MaxIterationBehavior::GracefulSummary,
             detect_protocol_without_tools: true,
             draft_reasoning: StreamReasoningMode::Status,
+            force_buffered_provider: false,
         }
     }
 }
