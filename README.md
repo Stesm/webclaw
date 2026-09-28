@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="docs/assets/zeroclaw-banner.png" alt="webclaw" width="600" />
-</p>
-
 <h1 align="center">🦀 webclaw — web-first форк ZeroClaw</h1>
 
 <p align="center">
