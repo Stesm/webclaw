@@ -1,5 +1,8 @@
 //! Per-caller loop behaviour knobsconsolidation).
 
+use std::collections::HashSet;
+use std::sync::Arc;
+
 use zeroclaw_config::schema::StreamReasoningMode;
 
 /// How to handle max-tool-iteration exhaustion.
@@ -28,6 +31,16 @@ pub struct LoopKnobs {
     /// cron transcript tap, which wants the event stream but must not change
     /// the job's provider transport.
     pub force_buffered_provider: bool,
+    /// Physical provider references admitted for this automatically routed
+    /// turn. Side routes such as a dedicated vision provider must satisfy the
+    /// same boundary as the primary/fallback chain.
+    pub provider_attempt_allowlist: Option<Arc<HashSet<String>>>,
+    /// The caller judges steering itself (memory write, sender authority,
+    /// tool ceiling) and lends the receiver only so the loop can see that a
+    /// message is waiting. After each tool round the loop then stops with
+    /// `SteeringPending` instead of draining, so the message reaches
+    /// the model at the next step rather than after the final answer.
+    pub yield_to_steering: bool,
 }
 
 impl Default for LoopKnobs {
@@ -38,6 +51,8 @@ impl Default for LoopKnobs {
             detect_protocol_without_tools: true,
             draft_reasoning: StreamReasoningMode::Status,
             force_buffered_provider: false,
+            provider_attempt_allowlist: None,
+            yield_to_steering: false,
         }
     }
 }
