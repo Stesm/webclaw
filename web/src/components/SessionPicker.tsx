@@ -285,7 +285,7 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
         className="flex items-center gap-2 px-3 h-7 rounded-[var(--radius-md)] text-xs font-medium border border-pc-border bg-pc-elevated text-pc-text-secondary transition-colors hover:text-pc-text hover:border-pc-border-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
       >
         <MessagesSquare className="h-3.5 w-3.5" />
-        <span className="max-w-[160px] truncate">{activeLabel}</span>
+        <span className="max-w-[110px] sm:max-w-[160px] truncate">{activeLabel}</span>
         <ChevronDown className="h-3 w-3" />
       </button>
 
@@ -294,7 +294,7 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
           id={panelId}
           role="group"
           aria-label={t('agent.sessions')}
-          className="absolute right-0 mt-1.5 rounded-[var(--radius-md)] border border-pc-border bg-pc-elevated shadow-[var(--pc-shadow-md)] z-50 py-1 w-[300px] max-h-80 overflow-y-auto"
+          className="absolute right-0 mt-1.5 rounded-[var(--radius-md)] border border-pc-border bg-pc-elevated shadow-[var(--pc-shadow-md)] z-50 py-1 w-[min(300px,calc(100vw-2rem))] max-h-80 overflow-y-auto"
         >
           {storesConversations ? (
             <button

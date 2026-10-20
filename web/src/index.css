@@ -124,6 +124,10 @@ body {
   margin: 0;
   overflow-x: hidden;
   max-width: 100vw;
+  /* Drop the double-tap-to-zoom gesture: the dashboard is an app surface
+     (installed PWA), and a stray double-tap on a message must not magnify
+     the page. `manipulation` keeps panning and pinch-zoom-free scrolling. */
+  touch-action: manipulation;
 }
 
 #root {
@@ -782,4 +786,28 @@ code, kbd, pre {
   font-size: 0.75rem;
   color: var(--pc-text-muted);
   margin-top: 0.25rem;
+}
+
+/* ── Mobile: no accidental zoom ─────────────────────────────────────────
+   iOS Safari zooms the visual viewport when a focused control's computed
+   font-size is below 16px, and — unlike every other browser — it does NOT
+   restore the zoom when that control loses focus: the page stays magnified
+   until a reload. The chat composer is `text-sm` (14px), so tapping the
+   input zoomed the page in and left it there.
+
+   Pinning the control font size on narrow viewports fixes the zoom at its
+   source and leaves the composer at its designed size. This rule is
+   unlayered on purpose: Tailwind v4 emits utilities inside
+   `@layer utilities`, and an unlayered declaration outranks a layered one
+   regardless of specificity, so `text-sm` on the composer cannot win here.
+
+   `touch-action: manipulation` on <body> drops the double-tap-to-zoom
+   gesture, so the dashboard behaves like the installed app instead of a web
+   page. */
+@media (max-width: 768px) {
+  input,
+  textarea,
+  select {
+    font-size: 16px;
+  }
 }

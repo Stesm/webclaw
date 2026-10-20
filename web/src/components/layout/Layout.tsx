@@ -74,7 +74,13 @@ export default function Layout() {
             changes within a page (e.g. /config/providers → /config/browser).
             Keying on the full pathname remounted the entire route tree
             on every section click and reset scroll/state. */}
-        <main className="flex-1 overflow-y-auto min-h-0">
+        {/* `overflow-x-hidden` is a backstop, not the fix: `overflow-y: auto`
+            with a visible x-axis computes the x-axis to `auto`, so any
+            over-wide child used to turn the whole page into a sideways-scrolling
+            strip on a phone. The overflow itself is fixed at its source (the
+            chat header's pickers now shrink and wrap); this only keeps a
+            future stray width from dragging the transcript off-screen. */}
+        <main className="flex-1 overflow-y-auto overflow-x-hidden min-h-0">
           <ErrorBoundary key={pathname.split('/')[1] ?? ''}>
             <Outlet />
           </ErrorBoundary>

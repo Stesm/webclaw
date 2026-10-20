@@ -2,7 +2,15 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- `maximum-scale`/`user-scalable` pin the visual viewport: the dashboard
+         is an app surface (the mobile PWA is installed to the home screen),
+         and a pinch-zoom that fights the layout is a bug, not a feature. The
+         focus-zoom half of the problem is fixed in `index.css` (a focused
+         control under 16px makes iOS Safari zoom and never restore). -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"
+    />
     <meta name="color-scheme" content="dark" />
     <meta name="theme-color" content="#1e1e24" />
     <link rel="icon" type="image/png" href="/_app/logo.png" />

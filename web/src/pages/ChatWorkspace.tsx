@@ -369,7 +369,12 @@ export default function ChatWorkspace({ initialAlias, initialSessionId }: ChatWo
           const paneClass = visible
             ? effectiveLayout === 'split'
               ? 'flex flex-col flex-1 min-w-0 min-h-0'
-              : 'flex flex-col h-full'
+              : // `min-w-0` matters as much in the single-pane layout: without
+                // it the pane keeps its content's intrinsic width, so a chat
+                // header wider than the phone (the conversation + model
+                // pickers) stretches the pane and makes the whole page scroll
+                // sideways instead of the pickers shrinking.
+                'flex flex-col h-full min-w-0'
             : 'hidden';
           return (
             <div
