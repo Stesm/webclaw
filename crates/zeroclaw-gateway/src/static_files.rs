@@ -79,7 +79,12 @@ pub async fn handle_spa_fallback(State(state): State<AppState>, uri: Uri) -> Res
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8".to_string()),
-            (header::CACHE_CONTROL, "no-cache".to_string()),
+            // The app shell must never be served from a cache. An installed
+            // PWA (iOS standalone) snapshots it aggressively, and a stale
+            // shell keeps the old asset hashes — the app then runs the
+            // previous build's layout while looking freshly loaded. `no-store`
+            // drops the copy entirely; the shell is a few kilobytes.
+            (header::CACHE_CONTROL, "no-store".to_string()),
         ],
         html,
     )
@@ -303,7 +308,9 @@ fn serve_embedded_file(path: &str) -> Option<Response> {
     let cache = if path.contains("assets/") {
         "public, max-age=31536000, immutable".to_string()
     } else {
-        "no-cache".to_string()
+        // The shell and the manifest drive the installed PWA: a stale copy
+        // pins the app to the previous build's layout. Never store them.
+        "no-store".to_string()
     };
 
     Some(

@@ -145,6 +145,43 @@ body {
   min-height: 100dvh;
 }
 
+/* Installed PWA (standalone). The web view covers the whole screen, but
+   `dvh` measures only the part above the home indicator — sizing the shell
+   from it left a dead band at the bottom of the screen. The large viewport
+   is the full screen, so the shell is sized from that instead, and the
+   composer pads itself out of the home indicator with
+   `env(safe-area-inset-bottom)`. In a browser tab there is no home
+   indicator and `dvh` is exactly right, so the rule is scoped to
+   standalone.
+
+   Unlayered on purpose: Tailwind v4 emits utilities inside
+   `@layer utilities`, and an unlayered declaration outranks a layered one
+   regardless of specificity, so the `h-dvh` utility cannot win here. */
+@media (display-mode: standalone) {
+  html,
+  body,
+  #root {
+    min-height: 100lvh;
+  }
+
+  .app-shell {
+    height: 100lvh;
+  }
+}
+
+/* Same rule for the legacy `navigator.standalone` flag, for iOS versions whose
+   `display-mode` query does not match (see the inline script in
+   `index.html`). */
+[data-standalone='1'],
+[data-standalone='1'] body,
+[data-standalone='1'] #root {
+  min-height: 100lvh;
+}
+
+[data-standalone='1'] .app-shell {
+  height: 100lvh;
+}
+
 /* Focus ring — solid accent for a strong, legible, WCAG-friendly ring
    (was a low-contrast 30%-alpha color). */
 :focus-visible {
