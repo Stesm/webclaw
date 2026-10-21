@@ -62,10 +62,8 @@ export default function Layout() {
           mobile. The rail is always slim, so the offset is constant. */}
       {/* `h-dvh`, not `h-screen`: see the note in `index.css` — a `vh`-sized
           shell is taller than the area an installed PWA can paint, which
-          showed up as a vertical scroll on the whole app. `app-shell` lets
-          the standalone-PWA rule in `index.css` resize it to the large
-          viewport, so the app reaches the bottom of the screen there. */}
-      <div className="app-shell flex flex-col flex-1 min-w-0 h-dvh md:ml-14 ml-0">
+          showed up as a vertical scroll on the whole app. */}
+      <div className="flex flex-col flex-1 min-w-0 h-dvh md:ml-14 ml-0">
         <Header
           onMenuToggle={() => setSidebarOpen((v) => !v)}
           onOpenPalette={openPalette}

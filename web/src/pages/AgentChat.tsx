@@ -816,11 +816,13 @@ export function AgentChatInner({
         />
       )}
 
-      {/* Input area. The bottom safe-area inset is padding: with
+      {/* Input area. The bottom safe-area inset is padding, not height: with
           `viewport-fit=cover` the composer would otherwise sit under the
-          home indicator of an installed PWA, and the system gesture would
-          steal the tap. */}
-      <div className="border-t border-pc-border bg-pc-surface p-4 pb-[calc(1rem+env(safe-area-inset-bottom))]">
+          home indicator of an installed PWA and the system gesture would
+          steal the tap. `max()` rather than a sum — the app is already sized
+          to the dynamic viewport, so the inset is the whole allowance and
+          adding the usual padding on top would open a second gap. */}
+      <div className="border-t border-pc-border bg-pc-surface p-4 pb-[max(1rem,env(safe-area-inset-bottom))]">
         {/* Slash-command autocomplete popover (#7137) */}
         {showCommandHint && matchedCommands.length > 0 && (
           <div className="relative max-w-4xl mx-auto">

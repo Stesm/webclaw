@@ -64,26 +64,6 @@
         }
       })();
     </script>
-    <script>
-      // Mark the document as an installed app. `display-mode: standalone` is
-      // the standard signal, but iOS still exposes the legacy
-      // `navigator.standalone` on some versions — and on those the media
-      // query may not match, which would leave the app shell sized to the
-      // short viewport and a dead band at the bottom of the screen. Flagging
-      // it here lets the CSS in `index.css` cover both.
-      (function () {
-        try {
-          var standalone =
-            window.matchMedia("(display-mode: standalone)").matches ||
-            window.navigator.standalone === true;
-          if (standalone) {
-            document.documentElement.setAttribute("data-standalone", "1");
-          }
-        } catch (e) {
-          /* no matchMedia / no navigator.standalone: the CSS query decides */
-        }
-      })();
-    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
