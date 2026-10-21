@@ -54,13 +54,16 @@ export default function Layout() {
   }, [pathname]);
 
   return (
-    <div className="min-h-screen bg-pc-base text-pc-text">
+    <div className="min-h-dvh bg-pc-base text-pc-text">
       {/* Fixed slim icon rail (desktop) + drawer (mobile). */}
       <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} />
 
       {/* Main area — offset by the fixed 56px rail on desktop, full-width on
           mobile. The rail is always slim, so the offset is constant. */}
-      <div className="flex flex-col flex-1 min-w-0 h-screen md:ml-14 ml-0">
+      {/* `h-dvh`, not `h-screen`: see the note in `index.css` — a `vh`-sized
+          shell is taller than the area an installed PWA can paint, which
+          showed up as a vertical scroll on the whole app. */}
+      <div className="flex flex-col flex-1 min-w-0 h-dvh md:ml-14 ml-0">
         <Header
           onMenuToggle={() => setSidebarOpen((v) => !v)}
           onOpenPalette={openPalette}

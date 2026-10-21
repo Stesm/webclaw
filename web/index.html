@@ -6,10 +6,13 @@
          is an app surface (the mobile PWA is installed to the home screen),
          and a pinch-zoom that fights the layout is a bug, not a feature. The
          focus-zoom half of the problem is fixed in `index.css` (a focused
-         control under 16px makes iOS Safari zoom and never restore). -->
+         control under 16px makes iOS Safari zoom and never restore).
+         `viewport-fit=cover` lets the installed app use the full screen
+         instead of being letterboxed by the safe-area insets; the insets are
+         then honoured as padding by the header and the chat composer. -->
     <meta
       name="viewport"
-      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
     />
     <meta name="color-scheme" content="dark" />
     <meta name="theme-color" content="#1e1e24" />

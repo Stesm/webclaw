@@ -82,7 +82,14 @@ export default function Header({ onMenuToggle, onOpenPalette }: HeaderProps) {
 
   return (
     <>
-      <header className="h-14 flex items-center justify-between px-6 border-b animate-fade-in relative" style={{ background: 'var(--pc-bg-surface)', borderColor: 'var(--pc-border)', backdropFilter: 'blur(12px)', zIndex: 100 }}>
+      {/* The top safe-area inset is padding, not height: with
+          `viewport-fit=cover` the app paints under the status bar, so the
+          header grows by the inset and keeps its 3.5rem of content below
+          it. Without this the notch clips the title and the action icons. */}
+      <header
+        className="h-[calc(3.5rem+env(safe-area-inset-top))] pt-[env(safe-area-inset-top)] flex items-center justify-between px-6 border-b animate-fade-in relative"
+        style={{ background: 'var(--pc-bg-surface)', borderColor: 'var(--pc-border)', backdropFilter: 'blur(12px)', zIndex: 100 }}
+      >
         <div className="flex items-center gap-3 min-w-0">
           {/* Hamburger — opens the mobile drawer; hidden on desktop where the
               slim rail is always present. */}

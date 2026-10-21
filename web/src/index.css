@@ -112,6 +112,9 @@
 }
 
 html {
+  /* No rubber-band overscroll: the installed PWA has no address bar to pull
+     back, so the bounce would only reveal the page behind the app shell. */
+  overscroll-behavior: none;
 }
 
 body {
@@ -128,10 +131,18 @@ body {
      (installed PWA), and a stray double-tap on a message must not magnify
      the page. `manipulation` keeps panning and pinch-zoom-free scrolling. */
   touch-action: manipulation;
+  /* The dynamic viewport height, not `vh`. Installed as a PWA, iOS reports
+     `100vh` as the *large* viewport (the full screen), while the area the
+     app may actually paint is smaller — so a `vh`-sized shell overflows by
+     the safe-area inset and the whole app grows a vertical scrollbar.
+     `dvh` tracks the viewport that is really visible, and shrinks with the
+     on-screen keyboard. */
+  min-height: 100dvh;
+  overscroll-behavior: none;
 }
 
 #root {
-  min-height: 100vh;
+  min-height: 100dvh;
 }
 
 /* Focus ring — solid accent for a strong, legible, WCAG-friendly ring

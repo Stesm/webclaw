@@ -816,8 +816,11 @@ export function AgentChatInner({
         />
       )}
 
-      {/* Input area */}
-      <div className="border-t border-pc-border bg-pc-surface p-4">
+      {/* Input area. The bottom safe-area inset is padding: with
+          `viewport-fit=cover` the composer would otherwise sit under the
+          home indicator of an installed PWA, and the system gesture would
+          steal the tap. */}
+      <div className="border-t border-pc-border bg-pc-surface p-4 pb-[calc(1rem+env(safe-area-inset-bottom))]">
         {/* Slash-command autocomplete popover (#7137) */}
         {showCommandHint && matchedCommands.length > 0 && (
           <div className="relative max-w-4xl mx-auto">
@@ -1013,7 +1016,10 @@ const MessageItem = memo(function MessageItem({
           )}
         </div>
       )}
-      <div className="relative max-w-[75%]">
+      {/* Compact mode on a phone: the bubble takes 90-95% of the row, so the
+          leftover is a single offset on the far side rather than a wide
+          gutter on both. Wider screens keep the roomier 75%. */}
+      <div className={`relative ${compact ? 'max-w-[92%] sm:max-w-[75%]' : 'max-w-[75%]'}`}>
         <div
           className={`${compact ? 'rounded-[var(--radius-md)] px-3 py-1.5 border' : 'rounded-[var(--radius-lg)] px-4 py-3 border'} text-pc-text ${
             msg.notice
