@@ -1853,6 +1853,26 @@ async fn process_chat_message(
         }
     }
 
+    // Persist the operator's message as soon as the turn starts, so the
+    // conversation is visible while the agent is still working: the dashboard
+    // lists it (and names it after its first message) instead of showing an
+    // empty session, and a reload that happens mid-turn does not lose what the
+    // operator wrote.
+    //
+    // The row is transient. The turn's own history is the authoritative
+    // transcript and replaces the session wholesale when the turn ends (see
+    // `persist_agent_conversation_state`), so the store never ends up with two
+    // copies of the message. It is written verbatim, exactly as the operator
+    // typed it, because that is what the dashboard shows while the turn runs.
+    //
+    // Only an existing session is written: appending to an unknown key would
+    // recreate a session the operator deleted.
+    if let Some(ref backend) = state.session_backend
+        && backend.session_exists(session_key)
+    {
+        let _ = backend.append(session_key, &zeroclaw_providers::ChatMessage::user(content));
+    }
+
     let (turn_alias, turn_provider, turn_model) = agent.attribution_fields();
     let provider_label = turn_provider.clone();
     let cost_tracking_context = state.cost_tracker.as_ref().map(|tracker| {
@@ -3618,6 +3638,63 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         );
     }
 
+    #[test]
+    fn the_operator_message_is_persisted_while_the_turn_is_still_running() {
+        run_ws_regression(
+            "ws-user-message-persisted-during-turn",
+            the_operator_message_is_persisted_while_the_turn_is_still_running_inner,
+        );
+    }
+
+    async fn the_operator_message_is_persisted_while_the_turn_is_still_running_inner() {
+        // The operator's message belongs to the transcript as soon as the turn
+        // starts: the dashboard lists the conversation (and names it after its
+        // first message) while the agent is still working, and a reload
+        // mid-turn does not lose what was typed. The turn's own history is
+        // the authoritative transcript and replaces this row when the turn
+        // ends, so it must not end up as a second copy.
+        let mut fixture = ParkedTurnFixture::spawn().await;
+        let session_id = "early-user-persist";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let (mut client, _session_start) = fixture.connect(session_id).await;
+
+        let prompt = "visible before the answer is ready";
+        fixture.start_parked_turn(&mut client, prompt).await;
+
+        // The provider is parked: the turn is in flight and has not answered.
+        let transcript = fixture.backend.load(&session_key);
+        let user_rows: Vec<&str> = transcript
+            .iter()
+            .filter(|message| message.role == "user")
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(
+            user_rows,
+            vec![prompt],
+            "the operator's message is persisted verbatim while the turn runs: {user_rows:?}"
+        );
+
+        fixture.release_next();
+        fixture.wait_for_turn_to_settle(&session_key).await;
+
+        let transcript = fixture.backend.load(&session_key);
+        let user_rows: Vec<&str> = transcript
+            .iter()
+            .filter(|message| message.role == "user")
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(
+            user_rows.len(),
+            1,
+            "the turn's history replaces the early row instead of duplicating it: {user_rows:?}"
+        );
+        assert!(
+            user_rows[0].ends_with(prompt),
+            "the persisted user turn still carries the operator's words: {user_rows:?}"
+        );
+        fixture.shutdown();
+    }
+
     async fn reconnect_during_detached_turn_refreshes_history_before_the_follow_up_inner() {
         // A socket that reconnects while the detached turn is still running
         // seeds its agent from the transcript as persisted at that moment. Its
@@ -3639,11 +3716,20 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         disconnect_viewer(first).await;
         assert!(fixture.has_live_turn(&session_key));
 
-        // Reconnect before the detached turn finishes: nothing is persisted
-        // yet, so this socket's history snapshot is empty.
+        // Reconnect before the detached turn finishes. The operator's message
+        // is already in the transcript — it is persisted when the turn starts,
+        // not when the turn ends — so this socket resumes a conversation that
+        // holds the prompt but not the answer yet.
         let (mut second, session_start) = fixture.connect(session_id).await;
-        assert_eq!(session_start["resumed"], false);
-        assert_eq!(session_start["message_count"], 0);
+        assert_eq!(session_start["resumed"], true);
+        assert_eq!(session_start["message_count"], 1);
+        let snapshot = fixture.backend.load(&session_key);
+        assert!(
+            snapshot
+                .iter()
+                .any(|message| message.role == "user" && message.content == first_prompt),
+            "the reconnected socket sees the operator's message: {snapshot:?}"
+        );
 
         // The follow-up queues behind the running turn on the session permit;
         // it must not start a concurrent turn.
