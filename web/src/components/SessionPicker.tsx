@@ -267,7 +267,7 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
     : `${t('agent.session_untitled')} ${sessionId.slice(0, 8)}`;
 
   return (
-    <div className="relative" ref={containerRef}>
+    <div className="relative min-w-0 shrink" ref={containerRef}>
       <button
         ref={triggerRef}
         type="button"
@@ -282,10 +282,13 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
         aria-expanded={open}
         aria-controls={open ? panelId : undefined}
         title={t('agent.sessions')}
-        className="flex items-center gap-2 px-3 h-7 rounded-[var(--radius-md)] text-xs font-medium border border-pc-border bg-pc-elevated text-pc-text-secondary transition-colors hover:text-pc-text hover:border-pc-border-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
+        className="flex w-full items-center gap-2 px-3 h-7 rounded-[var(--radius-md)] text-xs font-medium border border-pc-border bg-pc-elevated text-pc-text-secondary transition-colors hover:text-pc-text hover:border-pc-border-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] min-w-0"
       >
-        <MessagesSquare className="h-3.5 w-3.5" />
-        <span className="max-w-[110px] sm:max-w-[160px] truncate">{activeLabel}</span>
+        {/* The icon is the first thing to go on a phone: the label already
+            says "Conversation …", and the row has to fit the model alias
+            next to it. */}
+        <MessagesSquare className="hidden sm:block h-3.5 w-3.5 shrink-0" />
+        <span className="min-w-0 truncate max-w-[140px] sm:max-w-[160px]">{activeLabel}</span>
         <ChevronDown className="h-3 w-3" />
       </button>
 

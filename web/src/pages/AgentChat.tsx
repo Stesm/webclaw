@@ -597,40 +597,45 @@ export function AgentChatInner({
           </span>
         </div>
       )}
-      {/* Header with model selector. `flex-wrap` + `min-w-0`: on a phone the
-          conversation and model pickers together are wider than the viewport,
-          and a rigid single row pushed them past the edge — the page then
-          scrolled sideways and the whole transcript slid out of view. Now the
-          pickers wrap onto their own line and the agent name truncates
-          instead of forcing the header wider than the screen. */}
-      <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 px-4 py-2 border-b border-pc-border bg-pc-surface">
-        <div className="flex items-center gap-2 min-w-0">
+      {/* Header with model selector. One row, never two: the conversation and
+          model pickers are the parts that must stay on screen, and wrapping
+          them onto a second line doubled the header's height and pushed the
+          transcript into a vertical scroll on a phone. So the row stays rigid
+          and the pickers absorb the pressure instead — they shrink and their
+          labels truncate (see `SessionPicker` and the model button below).
+          The agent name is redundant here: the workspace tab bar above
+          already names the agent, so it only takes room on wider screens. */}
+      <div className="flex items-center gap-2 px-4 py-2 border-b border-pc-border bg-pc-surface">
+        <div className="flex items-center gap-2 min-w-0 shrink-0">
           <Bot className="h-4 w-4 text-pc-accent shrink-0" />
-          <span className="text-sm font-medium text-pc-text truncate">{agentAlias}</span>
+          <span className="hidden sm:inline text-sm font-medium text-pc-text truncate">
+            {agentAlias}
+          </span>
           <Link
             to={`/agent/${encodeURIComponent(agentAlias)}/workspace`}
             className="inline-flex items-center gap-1 px-2 h-6 rounded-[var(--radius-md)] text-xs font-medium text-pc-text-secondary transition-colors hover:text-pc-text hover:bg-[var(--pc-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] shrink-0"
             title={t('agentchat.open_workspace')}
+            aria-label={t('agentchat.open_workspace')}
           >
             <FolderOpen className="h-3.5 w-3.5" />
-            {t('agentchat.files')}
+            <span className="hidden sm:inline">{t('agentchat.files')}</span>
           </Link>
         </div>
 
-        {/* The two pickers wrap onto their own lines too: on a 320px phone
-            they do not fit side by side, and without the wrap the model
-            button was pushed past the right edge. */}
-        <div className="flex flex-wrap items-center gap-2 min-w-0">
+        <div className="flex items-center gap-2 min-w-0 ml-auto">
           <SessionPicker agentAlias={agentAlias} />
 
-          <div className="relative" ref={modelDropdownRef}>
+          {/* The model (network) picker keeps its full width: its alias is
+              what the operator reads, and the conversation picker next to it
+              is the one that can afford to truncate. */}
+          <div className="relative shrink-0" ref={modelDropdownRef}>
             <button
               type="button"
               onClick={() => setShowModelDropdown((v) => !v)}
               disabled={modelLoading || typing || (availableModels.length === 0 && currentModel === null)}
-              className="flex items-center gap-2 px-3 h-7 rounded-[var(--radius-md)] text-xs font-medium border border-pc-border bg-pc-elevated text-pc-text-secondary transition-colors hover:text-pc-text hover:border-pc-border-strong disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
+              className="flex w-full items-center gap-2 px-3 h-7 rounded-[var(--radius-md)] text-xs font-medium border border-pc-border bg-pc-elevated text-pc-text-secondary transition-colors hover:text-pc-text hover:border-pc-border-strong disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] min-w-0"
             >
-              <span className="max-w-[110px] sm:max-w-[180px] truncate">
+              <span className="min-w-0 truncate max-w-[130px] sm:max-w-[180px]">
                 {modelLoading
                   ? t('agent.model_switching')
                   : (currentModel ?? (availableModels.length === 0 ? t('agent.model_loading') : t('agent.select_model')))}
@@ -671,9 +676,12 @@ export function AgentChatInner({
         </div>
       )}
 
-      {/* Chat toolbar */}
+      {/* Chat toolbar. Icon-only on a phone: three labelled buttons did not
+          fit one line, and wrapping them onto a second line cost the same
+          vertical space the header was just refunded. Every button keeps its
+          accessible name. */}
       {messages.length > 0 && (
-        <div className="flex flex-wrap items-center justify-end gap-2 px-4 py-2 border-b border-pc-border bg-pc-surface">
+        <div className="flex items-center justify-end gap-2 px-4 py-2 border-b border-pc-border bg-pc-surface">
           <Button
             variant="ghost"
             size="sm"
@@ -681,7 +689,7 @@ export function AgentChatInner({
             aria-label={t('agent.compact_mode')}
           >
             {compact ? <Maximize2 className="h-3 w-3" /> : <Minimize2 className="h-3 w-3" />}
-            {t('agent.compact_mode')}
+            <span className="hidden sm:inline">{t('agent.compact_mode')}</span>
           </Button>
           <Button
             variant="ghost"
@@ -691,7 +699,9 @@ export function AgentChatInner({
             aria-pressed={showToolActivity}
           >
             <Wrench className="h-3 w-3" />
-            {showToolActivity ? t('agent.tool_activity_hide') : t('agent.tool_activity_show')}
+            <span className="hidden sm:inline">
+              {showToolActivity ? t('agent.tool_activity_hide') : t('agent.tool_activity_show')}
+            </span>
           </Button>
           <Button
             variant="danger"
@@ -700,7 +710,7 @@ export function AgentChatInner({
             aria-label={t('agent.clear_all')}
           >
             <Trash2 className="h-3 w-3" />
-            {t('agent.clear_all')}
+            <span className="hidden sm:inline">{t('agent.clear_all')}</span>
           </Button>
         </div>
       )}
