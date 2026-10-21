@@ -17,6 +17,10 @@ interface SessionRow {
   /** Full storage key, for read-only viewing of non-gateway sessions. */
   key: string;
   name?: string;
+  /** One-line excerpt of the conversation's first user message. The gateway
+   *  sends it for conversations the operator has not named; it is the label
+   *  of last resort before the raw session id. */
+  preview?: string;
   messageCount: number;
   lastActivity: string | null;
   /** False for the active conversation before its first persisted turn. */
@@ -25,8 +29,17 @@ interface SessionRow {
   openable: boolean;
 }
 
+/**
+ * Label for a conversation row.
+ *
+ * The operator's own name wins. A conversation they never named falls back to
+ * the gateway's excerpt of its first message, which says what the
+ * conversation is about — a raw session id says nothing. Only a conversation
+ * with neither gets the "untitled" marker.
+ */
 function rowLabel(row: SessionRow): string {
   if (row.name) return row.name;
+  if (row.preview) return row.preview;
   return `${t('agent.session_untitled')} ${row.id.slice(0, 8)}`;
 }
 
@@ -136,6 +149,7 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
           id: s.session_id,
           key: s.session_key,
           name: s.name,
+          preview: s.preview,
           messageCount: s.message_count,
           lastActivity: s.last_activity,
           persisted: true,

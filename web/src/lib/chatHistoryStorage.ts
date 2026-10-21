@@ -1,4 +1,5 @@
 import type { SessionMessageRow, TurnProgress, WsAttachment } from '@/types/api';
+import { stripServerEnvelopes } from '@/lib/serverEnvelope';
 
 const MAX_MESSAGES = 100;
 const PREFIX = 'zeroclaw_chat_history_v1:';
@@ -95,7 +96,11 @@ export function mapServerMessagesToPersisted(rows: SessionMessageRow[]): Persist
       out.push({
         id: nextId(),
         role: 'user',
-        content: row.content,
+        // The stored row carries the server's own markers (the runtime's
+        // date/time envelope, the channel wall-clock stamp). They are the
+        // model's metadata, not the operator's words — the bubble shows what
+        // the operator typed.
+        content: stripServerEnvelopes(row.content),
         timestamp: ts,
       });
     } else if (row.role === 'assistant') {

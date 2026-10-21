@@ -26,6 +26,7 @@ import ChatAttachmentCard from '@/components/ChatAttachmentCard';
 import AttachmentPreviewModal from '@/components/AttachmentPreviewModal';
 import type { WsAttachment } from '@/types/api';
 import { turnProgressToUiMessages } from '@/lib/chatHistoryStorage';
+import { stripServerEnvelopes } from '@/lib/serverEnvelope';
 
 const DRAFT_KEY_PREFIX = 'agent-chat';
 
@@ -948,17 +949,9 @@ export function AgentChatInner({
   );
 }
 
-// Channel-user (and some agent) messages arrive with a leading
-// `[YYYY-MM-DD HH:MM:SS TZ] ` prefix the gateway prepends. The zone is a chrono
-// `%Z` abbreviation (e.g. CEST) that JS `Date` can't reliably parse, so we
-// don't try — we just strip the prefix for display and copy; the bubble shows
-// its own wall-clock caption separately. Anchored to the start so a bracketed
-// datetime appearing mid-message (a log line, an error report) is left intact.
-const SERVER_TIMESTAMP_RE = /^\s*\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [^\]]+\]\s*/;
-
-function stripServerTimestamp(content: string): string {
-  return content.replace(SERVER_TIMESTAMP_RE, '');
-}
+// Server-owned markers (the channel wall-clock stamp, the runtime's
+// date/time envelope) are stripped for display and copy; the bubble shows its
+// own wall-clock caption separately. See `@/lib/serverEnvelope`.
 
 // Each chat message is rendered through this memoized component so that
 // typing into the input does not re-render every existing message (and
@@ -990,7 +983,7 @@ const MessageItem = memo(function MessageItem({
   // verbatim and never carry the gateway's `[timestamp]` prefix, so don't strip
   // them (that would clip a message starting with a bracketed datetime). Only
   // server-sourced messages can be prefixed.
-  const cleanContent = msg.local || msg.ephemeral ? msg.content : stripServerTimestamp(msg.content);
+  const cleanContent = msg.local || msg.ephemeral ? msg.content : stripServerEnvelopes(msg.content);
 
   return (
     <div

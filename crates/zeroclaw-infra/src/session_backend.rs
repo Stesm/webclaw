@@ -55,14 +55,15 @@ pub const SESSION_PREVIEW_SOURCE_MAX_CHARS: usize = 400;
 
 /// Turn a raw first-user-message into a one-line preview.
 ///
-/// Drops the channel wall-clock marker first (see
-/// [`strip_leading_channel_timestamp`]) so the character budget is spent on the
-/// operator's own words, then collapses whitespace so a multi-line opening
+/// Drops the runtime's own metadata first (see
+/// [`strip_runtime_timestamp_envelope`]) and then the channel wall-clock marker
+/// (see [`strip_leading_channel_timestamp`]) so the character budget is spent on
+/// the operator's own words, then collapses whitespace so a multi-line opening
 /// message cannot break the list row, then truncates on a character boundary.
 /// `None` for content that is empty after all of that, so callers treat it
 /// exactly like "no preview".
 pub fn normalize_session_preview(raw: &str) -> Option<String> {
-    let body = strip_leading_channel_timestamp(raw);
+    let body = strip_leading_channel_timestamp(strip_runtime_timestamp_envelope(raw));
     let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.is_empty() {
         return None;
@@ -92,18 +93,53 @@ fn strip_leading_channel_timestamp(content: &str) -> &str {
         return trimmed;
     };
     let inside = &rest[..end];
-    let bytes = inside.as_bytes();
-    let looks_like_timestamp = inside.len() >= 19
+    if !looks_like_datetime_stamp(inside) {
+        return trimmed;
+    }
+    rest[end + 1..].trim_start()
+}
+
+/// Drop the runtime's date/time envelope from a stored user message.
+///
+/// The agent prefixes every user turn with `[CURRENT DATE & TIME: <stamp>]`
+/// before the turn reaches the provider (`Agent::enrich_user_message`): the
+/// prefix is the model's authoritative clock, which is why it stays in the
+/// transcript the agent replays. It is runtime metadata, not something the
+/// operator wrote, so a surface that shows the operator their own words — the
+/// conversation label — must not show it.
+///
+/// The envelope is recognized by its literal label *and* the datetime shape of
+/// the stamp it carries, so an operator message that opens with the same words
+/// is left alone — the same rule [`strip_leading_channel_timestamp`] follows.
+fn strip_runtime_timestamp_envelope(content: &str) -> &str {
+    const ENVELOPE_LABEL: &str = "[CURRENT DATE & TIME:";
+    let trimmed = content.trim_start();
+    let Some(rest) = trimmed.strip_prefix(ENVELOPE_LABEL) else {
+        return trimmed;
+    };
+    let Some(end) = rest.find(']') else {
+        return trimmed;
+    };
+    if !looks_like_datetime_stamp(rest[..end].trim_start()) {
+        return trimmed;
+    }
+    rest[end + 1..].trim_start()
+}
+
+/// Whether a string starts with a `YYYY-MM-DD HH:MM:SS` date-time stamp.
+///
+/// The zone that may follow it is not inspected: it is a chrono `%Z`
+/// abbreviation whose spelling varies by host, and the date-time part alone
+/// already separates a stamp from operator prose.
+fn looks_like_datetime_stamp(stamp: &str) -> bool {
+    let bytes = stamp.as_bytes();
+    bytes.len() >= 19
         && bytes.first().is_some_and(u8::is_ascii_digit)
         && bytes.get(4) == Some(&b'-')
         && bytes.get(7) == Some(&b'-')
         && bytes.get(10) == Some(&b' ')
         && bytes.get(13) == Some(&b':')
-        && bytes.get(16) == Some(&b':');
-    if !looks_like_timestamp {
-        return trimmed;
-    }
-    rest[end + 1..].trim_start()
+        && bytes.get(16) == Some(&b':')
 }
 
 /// Structured routing context recorded alongside a session. Mirrors the
@@ -589,6 +625,30 @@ mod tests {
         assert_eq!(
             normalize_session_preview("[URGENT] deploy the fix").as_deref(),
             Some("[URGENT] deploy the fix")
+        );
+    }
+
+    #[test]
+    fn preview_drops_the_runtime_date_envelope() {
+        // The runtime prefixes a stored user turn with its own clock. The label
+        // is the operator's words, not the runtime's metadata.
+        assert_eq!(
+            normalize_session_preview(
+                "[CURRENT DATE & TIME: 2026-10-21 12:00:49 +03:00]\n\nУ сериала фонари по обложкам"
+            )
+            .as_deref(),
+            Some("У сериала фонари по обложкам")
+        );
+        // An operator message that opens with a bracketed tag of their own
+        // survives: only the runtime's literal label is stripped.
+        assert_eq!(
+            normalize_session_preview("[CURRENT DATE & TIME: не моё] привет").as_deref(),
+            Some("[CURRENT DATE & TIME: не моё] привет")
+        );
+        // A label with no closing bracket is not an envelope.
+        assert_eq!(
+            normalize_session_preview("[CURRENT DATE & TIME: 2026-10-21 привет").as_deref(),
+            Some("[CURRENT DATE & TIME: 2026-10-21 привет")
         );
     }
 }
