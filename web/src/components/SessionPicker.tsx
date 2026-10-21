@@ -63,6 +63,14 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
   const storesConversations = sessionPersistence === true;
 
   const [open, setOpen] = useState(false);
+  // Where the panel is placed. The panel is `fixed` and its position is
+  // computed from the trigger, then clamped to the viewport: anchored to the
+  // trigger alone it opened off-screen (the trigger sits mid-row, so a
+  // right-anchored 300px panel ran ~95px past the left edge on a 375px
+  // phone).
+  const [panelBox, setPanelBox] = useState<{ left: number; top: number; width: number } | null>(
+    null,
+  );
   // Links the trigger to the panel it discloses. The panel is a plain list of
   // buttons and editors, not an ARIA menu: it carries disclosure semantics
   // (aria-expanded + aria-controls) rather than promising menu keyboard
@@ -81,6 +89,22 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
   const [viewing, setViewing] = useState<SessionRow | null>(null);
 
   const containerRef = useRef<HTMLDivElement>(null);
+
+  // Place the open panel under the trigger, inside the viewport. The width is
+  // decided here (not by CSS) so the horizontal clamp can account for it.
+  // Best-effort by design: a non-DOM environment (the react-test-renderer
+  // harness) has no layout box, and then the panel simply falls back to its
+  // CSS default rather than failing to open.
+  const placePanel = useCallback(() => {
+    const anchor = containerRef.current;
+    if (!anchor || typeof anchor.getBoundingClientRect !== 'function') return;
+    const rect = anchor.getBoundingClientRect();
+    const vw = window.innerWidth;
+    const margin = 8;
+    const width = Math.min(300, vw - margin * 2);
+    const left = Math.max(margin, Math.min(rect.left, vw - width - margin));
+    setPanelBox({ left, top: rect.bottom + 6, width });
+  }, []);
   const triggerRef = useRef<HTMLButtonElement>(null);
 
   // Only the newest listing may commit. An active delete issues two overlapping
@@ -161,6 +185,23 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, [open]);
+
+  // The panel is placed from the trigger's box, so it has to be re-placed
+  // whenever that box moves — a viewport resize, or any scroll of the page
+  // underneath it. `capture` catches scrolls in nested scroll containers too.
+  // Guarded: the react-test-renderer harness stubs `window` without event
+  // methods, and there is nothing to reposition without a layout engine.
+  useEffect(() => {
+    if (!open) return;
+    if (typeof window.addEventListener !== 'function') return;
+    const reposition = () => placePanel();
+    window.addEventListener('resize', reposition);
+    window.addEventListener('scroll', reposition, true);
+    return () => {
+      window.removeEventListener('resize', reposition);
+      window.removeEventListener('scroll', reposition, true);
+    };
+  }, [open, placePanel]);
 
   // Escape closes the menu, and returns focus to the trigger so keyboard users
   // are not dropped onto <body>. A row editor handles Escape itself and stops
@@ -277,6 +318,7 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
             return;
           }
           setOpen(true);
+          placePanel();
           void load();
         }}
         aria-expanded={open}
@@ -297,7 +339,12 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
           id={panelId}
           role="group"
           aria-label={t('agent.sessions')}
-          className="absolute right-0 mt-1.5 rounded-[var(--radius-md)] border border-pc-border bg-pc-elevated shadow-[var(--pc-shadow-md)] z-50 py-1 w-[min(300px,calc(100vw-2rem))] max-h-80 overflow-y-auto"
+          style={
+            panelBox
+              ? { left: panelBox.left, top: panelBox.top, width: panelBox.width }
+              : undefined
+          }
+          className="fixed rounded-[var(--radius-md)] border border-pc-border bg-pc-elevated shadow-[var(--pc-shadow-md)] z-50 py-1 max-h-[min(20rem,60vh)] overflow-y-auto"
         >
           {storesConversations ? (
             <button
