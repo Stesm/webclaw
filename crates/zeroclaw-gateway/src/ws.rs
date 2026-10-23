@@ -1440,6 +1440,115 @@ fn has_assistant_chat_message(messages: &[zeroclaw_providers::ConversationMessag
     })
 }
 
+/// Whether the transcript already records the operator's message for this turn.
+///
+/// The loop stores the *enriched* form (`Agent::enrich_user_message` prefixes a
+/// `[CURRENT DATE & TIME: …]` envelope), so the text the operator typed matches
+/// as the tail after that envelope's blank line — never as an arbitrary
+/// substring, which would treat a short message like "ok" as already recorded
+/// because some older turn happens to contain those letters.
+fn records_operator_message(durable: &[zeroclaw_providers::ChatMessage], content: &str) -> bool {
+    let enriched_tail = format!("\n\n{content}");
+    durable
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .is_some_and(|message| {
+            message.content == content || message.content.ends_with(&enriched_tail)
+        })
+}
+
+/// Assistant text the operator already watched arrive that the transcript does
+/// not hold yet, or `None` when there is nothing worth adding.
+///
+/// `committed_response` is the loop's own record of the turn's visible text: for
+/// a stream that died after delivering output it carries exactly that output
+/// (already closed by the interruption marker), and for a turn that committed
+/// nothing it is the bare marker — the loop saying there was no visible text.
+/// `accumulated_text` is what this connection relayed as chunks; it is the
+/// fallback for a failure the loop reported before it could rebuild a response.
+///
+/// A transcript already ending in assistant text needs neither: that text is the
+/// committed reply, and appending the streamed superset would duplicate it.
+fn unpersisted_visible_reply(
+    durable: &[zeroclaw_providers::ChatMessage],
+    committed_response: &str,
+    accumulated_text: &str,
+) -> Option<String> {
+    let already_ended_in_reply = durable
+        .last()
+        .is_some_and(|message| message.role == "assistant" && !message.content.trim().is_empty());
+    if already_ended_in_reply {
+        return None;
+    }
+    let marker = zeroclaw_runtime::i18n::get_required_cli_string("turn-stream-interrupted");
+    let committed = committed_response.trim();
+    if !committed.is_empty() && committed != marker {
+        return Some(committed.to_string());
+    }
+    let streamed = accumulated_text.trim();
+    if streamed.is_empty() {
+        return None;
+    }
+    Some(format!("{streamed}\n\n{marker}"))
+}
+
+/// The durable transcript a turn that ended without a reply leaves behind.
+///
+/// [`persist_agent_conversation_state`] writes `agent.history()`, which is the
+/// authoritative record of a *finished* turn — and is missing everything the
+/// operator already watched arrive when the turn fails instead. The loop commits
+/// a round's messages only once that round finishes, so the output of the round
+/// that died never reaches the history; persisting the history alone turned a
+/// turn that showed text and tool activity into an empty conversation, and the
+/// failure itself left no trace at all.
+///
+/// This is the history plus what the failure boundary owes the reader: the
+/// operator's own message when the loop never recorded it (a prompt or routing
+/// failure), the output that was visible before the failure, and `closing` — the
+/// failure notice — last, so the transcript ends by naming what went wrong
+/// rather than stopping mid-thought.
+fn incomplete_turn_transcript(
+    agent: &zeroclaw_runtime::agent::Agent,
+    content: &str,
+    committed_response: &str,
+    accumulated_text: &str,
+    closing: &str,
+) -> Vec<zeroclaw_providers::ChatMessage> {
+    let mut durable = zeroclaw_providers::durable_chat_messages(agent.history());
+    if !records_operator_message(&durable, content) {
+        durable.push(zeroclaw_providers::ChatMessage::user(content));
+    }
+    if let Some(partial) = unpersisted_visible_reply(&durable, committed_response, accumulated_text)
+    {
+        durable.push(zeroclaw_providers::ChatMessage::assistant(&partial));
+    }
+    durable.push(zeroclaw_providers::ChatMessage::assistant(closing));
+    durable
+}
+
+/// The closing row of a failed turn: the localized failure text the live socket
+/// showed, marked as a failure boundary, with the cause behind it.
+///
+/// The localized text alone ("the selected model provider failed") does not say
+/// which fault ended the turn, which is the one thing a reader of the transcript
+/// needs; the cause is the same sanitized diagnostic the runtime trace records.
+/// The marker keeps a failure row from reading as an ordinary reply — for the
+/// operator scanning the chat, and for the model that replays this turn next.
+fn failed_turn_notice(failure_message: &str, cause: &str) -> String {
+    let marker = zeroclaw_runtime::i18n::get_required_cli_string("turn-failed");
+    let notice = format!("{marker} {failure_message}");
+    let cause = zeroclaw_providers::sanitize_api_error(cause);
+    // The diagnostic carries newlines from its per-attempt event list; one line
+    // keeps the row readable in the chat and cheap to replay to the provider.
+    let cause = cause.split_whitespace().collect::<Vec<_>>().join(" ");
+    if cause.is_empty() || cause == failure_message {
+        notice
+    } else {
+        format!("{notice}\n\n{cause}")
+    }
+}
+
 fn history_trimmed_ws_frame(
     dropped_messages: usize,
     dropped_turns: usize,
@@ -2638,11 +2747,46 @@ async fn process_chat_message(
             );
         }
         Err(e) => {
+            // The row the transcript ends with and the message the socket shows
+            // resolve from one failure frame, so a reload never reports a
+            // different fault than the live view did.
+            let user_message =
+                zeroclaw_runtime::agent::terminal_completion_error_message(&e.error, None);
+            let failure = ws_turn_failure_frame(
+                &e.error.to_string(),
+                user_message.as_deref(),
+                user_message.is_some(),
+            );
+            let failure_notice = failed_turn_notice(
+                failure["message"].as_str().unwrap_or_default(),
+                &e.error.to_string(),
+            );
+
             if let Some(ref backend) = state.session_backend {
-                persist_agent_conversation_state(backend.as_ref(), session_key, agent);
-                *persisted_watermark =
-                    note_own_transcript_write(&state.session_queue, session_key, agent);
+                let durable = incomplete_turn_transcript(
+                    agent,
+                    content,
+                    &e.committed_response,
+                    &accumulated_text,
+                    &failure_notice,
+                );
+                replace_conversation_state_unless_deleted(
+                    backend.as_ref(),
+                    session_key,
+                    &durable,
+                    agent.history_has_trim_breadcrumb(),
+                );
+                *persisted_watermark = PersistedWatermark {
+                    generation: state.session_queue.advance_generation(session_key),
+                    len: durable.len(),
+                };
             }
+
+            // Tell every live viewer the turn is over, so a socket that missed
+            // the error frame (detached, reconnecting, or a second device)
+            // rehydrates the transcript instead of showing a turn that never
+            // ends.
+            broadcast_turn_done(state, session_id, "error");
 
             // Set session state to error
             if let Some(ref backend) = state.session_backend {
@@ -2656,8 +2800,6 @@ async fn process_chat_message(
                     .with_attrs(::serde_json::json!({"error": format!("{}", e.error)})),
                 "Agent turn failed"
             );
-            let user_message =
-                zeroclaw_runtime::agent::terminal_completion_error_message(&e.error, None);
             let err = send_ws_turn_failure(sender, &e.error, user_message.as_deref()).await;
 
             // Broadcast error event
@@ -3280,6 +3422,32 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         )
     }
 
+    /// Text the failing completion delivers before the response body breaks.
+    const FAILED_TURN_PARTIAL: &str = "checking the episodes, one moment";
+
+    /// The SSE prefix the failing completion delivers: a started message and one
+    /// text delta, with no closing event — the body is then broken mid-stream.
+    fn failed_stream_head() -> String {
+        format!(
+            "event: message_start\n\
+data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_test\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-test\",\"usage\":{{\"input_tokens\":1}}}}}}\n\n\
+event: content_block_start\n\
+data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n\
+event: content_block_delta\n\
+data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{FAILED_TURN_PARTIAL}\"}}}}\n\n"
+        )
+    }
+
+    /// How the fixture's provider stream ends.
+    #[derive(Clone, Copy, PartialEq)]
+    enum ProviderStream {
+        /// Parks until the test releases it, then completes normally.
+        Parked,
+        /// Delivers its text, then breaks the response body, so the turn
+        /// reaches the failure boundary after the operator watched output.
+        FailsAfterOutput,
+    }
+
     type WsClient = tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >;
@@ -3303,6 +3471,17 @@ data: {{\"type\":\"message_stop\"}}\n\n"
 
     impl ParkedTurnFixture {
         async fn spawn() -> Self {
+            Self::spawn_with(ProviderStream::Parked).await
+        }
+
+        /// Same fixture, but its streaming completion delivers its text and then
+        /// breaks the response body, so the turn fails *after* the operator has
+        /// already watched output arrive.
+        async fn spawn_failing_after_output() -> Self {
+            Self::spawn_with(ProviderStream::FailsAfterOutput).await
+        }
+
+        async fn spawn_with(stream: ProviderStream) -> Self {
             let (request_seen_tx, request_seen) =
                 tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
             let (released, released_rx) = tokio::sync::watch::channel(0usize);
@@ -3325,6 +3504,29 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                                 PARKED_STREAM_HEAD.as_bytes(),
                             ))
                         });
+                        if stream == ProviderStream::FailsAfterOutput {
+                            let delivered = futures_util::stream::once(async move {
+                                Ok::<_, std::io::Error>(axum::body::Bytes::from(
+                                    failed_stream_head(),
+                                ))
+                            });
+                            // An `Err` item aborts the response body the way a
+                            // provider dropping the connection does, so the turn
+                            // fails with the delta already delivered. The pause
+                            // is what makes "already delivered" true: a body
+                            // aborted in the same poll as its last chunk can
+                            // have that chunk discarded with the reset.
+                            let broken = futures_util::stream::once(async move {
+                                tokio::time::sleep(Duration::from_millis(300)).await;
+                                Err::<axum::body::Bytes, std::io::Error>(std::io::Error::other(
+                                    "fixture provider broke the stream mid-response",
+                                ))
+                            });
+                            return (
+                                [(header::CONTENT_TYPE, "text/event-stream")],
+                                axum::body::Body::from_stream(delivered.chain(broken)),
+                            );
+                        }
                         let tail = futures_util::stream::once(async move {
                             let _ = released_rx.wait_for(|released| *released >= index).await;
                             Ok::<_, std::io::Error>(axum::body::Bytes::from(parked_stream_tail()))
@@ -3692,6 +3894,95 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             user_rows[0].ends_with(prompt),
             "the persisted user turn still carries the operator's words: {user_rows:?}"
         );
+        fixture.shutdown();
+    }
+
+    #[test]
+    fn a_failed_turn_keeps_what_the_operator_watched_and_names_the_failure() {
+        run_ws_regression(
+            "ws-failed-turn-keeps-visible-output",
+            a_failed_turn_keeps_what_the_operator_watched_and_names_the_failure_inner,
+        );
+    }
+
+    async fn a_failed_turn_keeps_what_the_operator_watched_and_names_the_failure_inner() {
+        // A turn that dies after the operator watched output arrive used to
+        // leave an empty conversation behind: the loop commits a round's
+        // messages only once that round finishes, so the history the gateway
+        // persisted held none of the streamed text, and the failure itself was
+        // never written down at all. The transcript owes the reader the text
+        // that was already delivered, closed by what actually went wrong.
+        let fixture = ParkedTurnFixture::spawn_failing_after_output().await;
+        let session_id = "failed-turn-visible-output";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let (mut client, _session_start) = fixture.connect(session_id).await;
+        let prompt = "which episodes still need checking";
+
+        send_chat(&mut client, prompt).await;
+
+        // The operator watches the reply arrive...
+        let chunk = next_text_frame(&mut client).await;
+        assert_eq!(chunk["type"], "chunk", "the turn streams to the client");
+        assert_eq!(chunk["content"], FAILED_TURN_PARTIAL);
+
+        // ...and then the turn fails.
+        let failure = loop {
+            let frame = next_text_frame(&mut client).await;
+            if frame["type"] == "error" {
+                break frame;
+            }
+        };
+        assert!(
+            failure["message"]
+                .as_str()
+                .is_some_and(|message| !message.is_empty()),
+            "the failure reaches the client: {failure:?}"
+        );
+
+        // A failed turn settles in the error state; there is no idle to wait for.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while fixture.has_live_turn(&session_key)
+                || fixture.session_state(&session_key).as_deref() != Some("error")
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("failed turn settles");
+
+        let rows: Vec<(String, String)> = fixture
+            .backend
+            .load(&session_key)
+            .into_iter()
+            .map(|message| (message.role, message.content))
+            .collect();
+        assert_eq!(
+            rows.len(),
+            3,
+            "the transcript holds the operator's message, the delivered text, and the failure: {rows:?}"
+        );
+        assert!(
+            rows[0].0 == "user" && rows[0].1.ends_with(prompt),
+            "the operator's message survives the failure: {rows:?}"
+        );
+        let interrupted =
+            zeroclaw_runtime::i18n::get_required_cli_string("turn-stream-interrupted");
+        assert!(
+            rows[1].0 == "assistant"
+                && rows[1].1.starts_with(FAILED_TURN_PARTIAL)
+                && rows[1].1.ends_with(&interrupted),
+            "the delivered text is glued to the interruption marker: {rows:?}"
+        );
+        let failed = zeroclaw_runtime::i18n::get_required_cli_string("turn-failed");
+        assert!(
+            rows[2].0 == "assistant" && rows[2].1.starts_with(&failed),
+            "the failure is the transcript's last row: {rows:?}"
+        );
+        assert!(
+            rows[2].1.len() > failed.len() + 1,
+            "the failure row names a cause, not just the marker: {rows:?}"
+        );
+
         fixture.shutdown();
     }
 
