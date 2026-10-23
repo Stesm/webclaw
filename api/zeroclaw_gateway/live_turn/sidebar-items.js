@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"struct":["ActiveTurn","ToolProgress","TurnProgress"],"type":["ActiveTurns"]};

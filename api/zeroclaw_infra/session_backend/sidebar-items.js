@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["SESSION_PREVIEW_MAX_CHARS","SESSION_PREVIEW_SOURCE_MAX_CHARS"],"fn":["normalize_session_preview"],"struct":["SessionContext","SessionMetadata","SessionQuery","SessionState","TimestampedMessage"],"trait":["SessionBackend"]};
