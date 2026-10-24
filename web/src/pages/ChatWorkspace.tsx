@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ChevronDown, ChevronUp } from 'lucide-react';
+import { ChevronDown } from 'lucide-react';
 import { AgentProvider } from '@/contexts/AgentContext';
 import { AgentChatInner, type AgentChatStatus } from '@/pages/AgentChat';
 import { ChatTabBar, type TabIndicator, type WorkspaceLayout } from '@/components/ChatTabBar';
@@ -396,32 +396,26 @@ export default function ChatWorkspace({ initialAlias, initialSessionId }: ChatWo
         />
       )}
 
-      {/* The handle's own row. A real row rather than a floating tab: a phone
-          right-aligns messages exactly under the top-right corner, so a
-          floating handle would sit on the first bubble. It is 36px — tall
-          enough for the handle to be square — and while the chrome is
-          collapsed it also carries what the hidden tab bar was saying: which
-          chat is on screen, and whether it is busy or has news. */}
-      <div
-        className={`flex h-9 shrink-0 items-center gap-2 bg-pc-surface px-2 ${
-          chromeOpen ? '' : 'border-b border-pc-border'
-        }`}
-      >
-        {!chromeOpen && (
-          <>
-            <LiveDot
-              streaming={!!indicators[activeTab?.key ?? '']?.streaming}
-              unread={Object.entries(indicators).some(
-                ([key, ind]) => ind.unread && key !== activeTab?.key,
-              )}
-            />
-            <span className="min-w-0 truncate text-[11px] text-pc-text-secondary">
-              {activeTab?.key ? (labelledTabs.find((tb) => tb.key === activeTab.key)?.label ?? '') : ''}
-            </span>
-          </>
-        )}
-        <ChromeHandle open={chromeOpen} onToggle={toggleChrome} />
-      </div>
+      {/* The way back from a collapsed chrome: a slim row that carries what the
+          hidden tab bar was saying — which chat is on screen, and whether it is
+          busy or has news — plus the handle that restores it. While the chrome
+          is open the row is gone entirely: its toggle then lives with the
+          pane's other action buttons, and the tab bar itself already names the
+          active chat. */}
+      {!chromeOpen && (
+        <div className="flex h-9 shrink-0 items-center gap-2 border-b border-pc-border bg-pc-surface px-2">
+          <LiveDot
+            streaming={!!indicators[activeTab?.key ?? '']?.streaming}
+            unread={Object.entries(indicators).some(
+              ([key, ind]) => ind.unread && key !== activeTab?.key,
+            )}
+          />
+          <span className="min-w-0 truncate text-[11px] text-pc-text-secondary">
+            {activeTab?.key ? (labelledTabs.find((tb) => tb.key === activeTab.key)?.label ?? '') : ''}
+          </span>
+          <ChromeHandle onToggle={toggleChrome} />
+        </div>
+      )}
 
       {/* Content area. Every open chat is mounted here at all times; only CSS
           visibility changes between tab/layout switches, so background sockets
@@ -463,6 +457,7 @@ export default function ChatWorkspace({ initialAlias, initialSessionId }: ChatWo
                   agentAlias={tab.alias}
                   onStatus={onStatusFor(tab.key)}
                   showChrome={chromeOpen}
+                  onToggleChrome={toggleChrome}
                 />
               </AgentProvider>
             </div>
@@ -474,22 +469,22 @@ export default function ChatWorkspace({ initialAlias, initialSessionId }: ChatWo
 }
 
 /**
- * The chrome handle: the control that opens and closes the workspace chrome
- * (the tab bar, every pane's pickers and the action toolbar). It sits at the
- * right end of the handle row, square, so it reads as that row's own tab and
- * keeps a tap target a thumb can find.
+ * The handle that restores a collapsed chrome, at the right end of the slim
+ * row. A square 32px button, so a thumb can find it; it only ever renders in
+ * the collapsed state (while the chrome is open its toggle sits with the
+ * pane's action buttons).
  */
-function ChromeHandle({ open, onToggle }: { open: boolean; onToggle: () => void }) {
+function ChromeHandle({ onToggle }: { onToggle: () => void }) {
   return (
     <button
       type="button"
       onClick={onToggle}
-      aria-expanded={open}
+      aria-expanded={false}
       aria-label={t('agent.chat_panel_toggle')}
       title={t('agent.chat_panel_toggle')}
       className="ml-auto flex h-8 w-8 shrink-0 items-center justify-center rounded-[var(--radius-md)] border border-pc-border text-pc-text-muted transition-colors hover:bg-[var(--pc-hover)] hover:text-pc-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
     >
-      {open ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+      <ChevronDown className="h-4 w-4" />
     </button>
   );
 }

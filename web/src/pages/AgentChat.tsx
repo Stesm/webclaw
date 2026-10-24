@@ -1,6 +1,6 @@
 import { memo, useMemo, useState, useEffect, useRef, useCallback } from 'react';
 import { Link, Navigate, useParams, useSearchParams } from 'react-router-dom';
-import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench, BarChart2, FolderOpen, ImagePlus, Loader2 } from 'lucide-react';
+import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, ChevronUp, Wrench, BarChart2, FolderOpen, ImagePlus, Loader2 } from 'lucide-react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useAgent, type ChatMessage } from '@/contexts/AgentContext';
@@ -136,6 +136,7 @@ export function AgentChatInner({
   agentAlias,
   onStatus,
   showChrome = true,
+  onToggleChrome,
 }: {
   agentAlias: string;
   onStatus?: (s: AgentChatStatus) => void;
@@ -145,6 +146,12 @@ export function AgentChatInner({
    * one side handle, so a phone can hand the whole viewport to the transcript.
    */
   showChrome?: boolean;
+  /**
+   * Collapse (or restore) the workspace chrome. Given, the pane's action
+   * toolbar also carries the control that folds the chrome away — which is why
+   * the toolbar exists at all for a conversation with no messages yet.
+   */
+  onToggleChrome?: () => void;
 }) {
   const {
     messages,
@@ -699,39 +706,58 @@ export function AgentChatInner({
       {/* Chat toolbar. Icon-only on a phone: three labelled buttons did not
           fit one line, and wrapping them onto a second line cost the same
           vertical space the header was just refunded. Every button keeps its
-          accessible name. Hidden with the rest of the pane chrome. */}
-      {showChrome && messages.length > 0 && (
+          accessible name. Hidden with the rest of the pane chrome — and the
+          row exists for an empty conversation only to hold the control that
+          folds the chrome away, since the workspace's own handle row is not
+          there while the chrome is open. */}
+      {showChrome && (messages.length > 0 || onToggleChrome) && (
         <div className="flex items-center justify-end gap-2 px-4 py-2 border-b border-pc-border bg-pc-surface">
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={toggleCompact}
-            aria-label={t('agent.compact_mode')}
-          >
-            {compact ? <Maximize2 className="h-3 w-3" /> : <Minimize2 className="h-3 w-3" />}
-            <span className="hidden sm:inline">{t('agent.compact_mode')}</span>
-          </Button>
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={toggleToolActivity}
-            aria-label={showToolActivity ? t('agent.tool_activity_hide') : t('agent.tool_activity_show')}
-            aria-pressed={showToolActivity}
-          >
-            <Wrench className="h-3 w-3" />
-            <span className="hidden sm:inline">
-              {showToolActivity ? t('agent.tool_activity_hide') : t('agent.tool_activity_show')}
-            </span>
-          </Button>
-          <Button
-            variant="danger"
-            size="sm"
-            onClick={handleClearAll}
-            aria-label={t('agent.clear_all')}
-          >
-            <Trash2 className="h-3 w-3" />
-            <span className="hidden sm:inline">{t('agent.clear_all')}</span>
-          </Button>
+          {messages.length > 0 && (
+            <>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={toggleCompact}
+                aria-label={t('agent.compact_mode')}
+              >
+                {compact ? <Maximize2 className="h-3 w-3" /> : <Minimize2 className="h-3 w-3" />}
+                <span className="hidden sm:inline">{t('agent.compact_mode')}</span>
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={toggleToolActivity}
+                aria-label={showToolActivity ? t('agent.tool_activity_hide') : t('agent.tool_activity_show')}
+                aria-pressed={showToolActivity}
+              >
+                <Wrench className="h-3 w-3" />
+                <span className="hidden sm:inline">
+                  {showToolActivity ? t('agent.tool_activity_hide') : t('agent.tool_activity_show')}
+                </span>
+              </Button>
+              <Button
+                variant="danger"
+                size="sm"
+                onClick={handleClearAll}
+                aria-label={t('agent.clear_all')}
+              >
+                <Trash2 className="h-3 w-3" />
+                <span className="hidden sm:inline">{t('agent.clear_all')}</span>
+              </Button>
+            </>
+          )}
+          {onToggleChrome && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={onToggleChrome}
+              aria-expanded={showChrome}
+              aria-label={t('agent.chat_panel_toggle')}
+              title={t('agent.chat_panel_toggle')}
+            >
+              <ChevronUp className="h-3 w-3" />
+            </Button>
+          )}
         </div>
       )}
 
