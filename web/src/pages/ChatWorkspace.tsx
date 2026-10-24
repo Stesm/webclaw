@@ -398,11 +398,12 @@ export default function ChatWorkspace({ initialAlias, initialSessionId }: ChatWo
 
       {/* The handle's own row. A real row rather than a floating tab: a phone
           right-aligns messages exactly under the top-right corner, so a
-          floating handle would sit on the first bubble. It is 28px, and while
-          the chrome is collapsed it also carries what the hidden tab bar was
-          saying — which chat is on screen, and whether it is busy or has news. */}
+          floating handle would sit on the first bubble. It is 36px — tall
+          enough for the handle to be square — and while the chrome is
+          collapsed it also carries what the hidden tab bar was saying: which
+          chat is on screen, and whether it is busy or has news. */}
       <div
-        className={`flex h-7 shrink-0 items-center gap-2 bg-pc-surface px-2 ${
+        className={`flex h-9 shrink-0 items-center gap-2 bg-pc-surface px-2 ${
           chromeOpen ? '' : 'border-b border-pc-border'
         }`}
       >
@@ -475,7 +476,8 @@ export default function ChatWorkspace({ initialAlias, initialSessionId }: ChatWo
 /**
  * The chrome handle: the control that opens and closes the workspace chrome
  * (the tab bar, every pane's pickers and the action toolbar). It sits at the
- * right end of the handle row, so it reads as that row's own tab.
+ * right end of the handle row, square, so it reads as that row's own tab and
+ * keeps a tap target a thumb can find.
  */
 function ChromeHandle({ open, onToggle }: { open: boolean; onToggle: () => void }) {
   return (
@@ -485,9 +487,9 @@ function ChromeHandle({ open, onToggle }: { open: boolean; onToggle: () => void 
       aria-expanded={open}
       aria-label={t('agent.chat_panel_toggle')}
       title={t('agent.chat_panel_toggle')}
-      className="ml-auto flex h-6 w-9 shrink-0 items-center justify-center rounded-[var(--radius-md)] border border-pc-border text-pc-text-muted transition-colors hover:bg-[var(--pc-hover)] hover:text-pc-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
+      className="ml-auto flex h-8 w-8 shrink-0 items-center justify-center rounded-[var(--radius-md)] border border-pc-border text-pc-text-muted transition-colors hover:bg-[var(--pc-hover)] hover:text-pc-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
     >
-      {open ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+      {open ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
     </button>
   );
 }

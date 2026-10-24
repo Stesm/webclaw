@@ -880,8 +880,10 @@ export function AgentChatInner({
           {/* One field, not a field with satellites: the attach and send/stop
               controls live inside the input's own border, so the composer
               reads as a single line of UI and the buttons cost no extra
-              height. */}
-          <div className="flex items-end gap-1 rounded-[var(--radius-lg)] border border-pc-border bg-pc-input px-1.5 py-1.5 transition-colors focus-within:border-pc-accent focus-within:ring-2 focus-within:ring-pc-accent/30">
+              height. The field carries no fill of its own either: the outline
+              and the focus ring are the whole affordance, so the bottom of the
+              chat stays the same surface as the transcript above it. */}
+          <div className="flex items-end gap-1 rounded-[var(--radius-lg)] border border-pc-border px-1.5 py-1.5 transition-colors focus-within:border-pc-accent focus-within:ring-2 focus-within:ring-pc-accent/30">
             <input
               ref={fileInputRef}
               type="file"
