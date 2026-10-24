@@ -61,10 +61,19 @@ function ContextBar({ contextMaxTokens, contextModelWindow, contextInputTokens }
 
   const label = `${t('agent.context_usage')}: ${fmtTokens(state.used).padStart(7)} / ${fmtTokens(state.denominator).padStart(7)}  [${state.cells}]  ${state.percent.toFixed(0)}%`;
 
+  // A chip, not a bar: it shares the composer's status line with the status
+  // pill, which is centered on the input, so it keeps to the right and shows
+  // the whole meter only where there is room for it. The full label stays
+  // reachable as the tooltip on a phone.
   return (
-    <div className="px-4 py-1.5 border-b text-[11px] font-mono flex items-center gap-2" style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)' }}>
-      <BarChart2 className="h-3 w-3 shrink-0" style={{ color: 'var(--pc-text-muted)' }} />
-      <span style={{ color: 'var(--pc-text-secondary)' }}>{label}</span>
+    <div
+      className="flex shrink-0 items-center gap-1.5 text-[10px] font-mono"
+      style={{ color: 'var(--pc-text-muted)' }}
+      title={label}
+    >
+      <BarChart2 className="h-3 w-3" />
+      <span className="hidden sm:inline">{label}</span>
+      <span className="sm:hidden">{state.percent.toFixed(0)}%</span>
     </div>
   );
 }
@@ -126,9 +135,16 @@ export interface AgentChatStatus {
 export function AgentChatInner({
   agentAlias,
   onStatus,
+  showChrome = true,
 }: {
   agentAlias: string;
   onStatus?: (s: AgentChatStatus) => void;
+  /**
+   * Whether this pane renders its own chrome: the header pickers and the
+   * action toolbar. The workspace hides them, together with its tab bar, behind
+   * one side handle, so a phone can hand the whole viewport to the transcript.
+   */
+  showChrome?: boolean;
 }) {
   const {
     messages,
@@ -605,7 +621,9 @@ export function AgentChatInner({
           and the pickers absorb the pressure instead — they shrink and their
           labels truncate (see `SessionPicker` and the model button below).
           The agent name is redundant here: the workspace tab bar above
-          already names the agent, so it only takes room on wider screens. */}
+          already names the agent, so it only takes room on wider screens.
+          Hidden while the workspace's chrome is collapsed. */}
+      {showChrome && (
       <div className="flex items-center gap-2 px-4 py-2 border-b border-pc-border bg-pc-surface">
         <div className="flex items-center gap-2 min-w-0 shrink-0">
           <Bot className="h-4 w-4 text-pc-accent shrink-0" />
@@ -668,6 +686,7 @@ export function AgentChatInner({
           </div>
         </div>
       </div>
+      )}
 
       {/* Connection status bar */}
       {error && (
@@ -680,8 +699,8 @@ export function AgentChatInner({
       {/* Chat toolbar. Icon-only on a phone: three labelled buttons did not
           fit one line, and wrapping them onto a second line cost the same
           vertical space the header was just refunded. Every button keeps its
-          accessible name. */}
-      {messages.length > 0 && (
+          accessible name. Hidden with the rest of the pane chrome. */}
+      {showChrome && messages.length > 0 && (
         <div className="flex items-center justify-end gap-2 px-4 py-2 border-b border-pc-border bg-pc-surface">
           <Button
             variant="ghost"
@@ -817,13 +836,16 @@ export function AgentChatInner({
         />
       )}
 
-      {/* Input area. The bottom safe-area inset is padding, not height: with
-          `viewport-fit=cover` the composer would otherwise sit under the
-          home indicator of an installed PWA and the system gesture would
-          steal the tap. `max()` rather than a sum — the app is already sized
-          to the dynamic viewport, so the inset is the whole allowance and
-          adding the usual padding on top would open a second gap. */}
-      <div className="border-t border-pc-border bg-pc-surface p-4 pb-[max(1rem,env(safe-area-inset-bottom))]">
+      {/* Input area. No panel background and no top border: the transcript
+          keeps the surface it already owns, so a phone spends its height on
+          messages instead of on a block of chrome. The bottom safe-area inset
+          is padding, not height: with `viewport-fit=cover` the composer would
+          otherwise sit under the home indicator of an installed PWA and the
+          system gesture would steal the tap. `max()` rather than a sum — the
+          app is already sized to the dynamic viewport, so the inset is the
+          whole allowance and adding the usual padding on top would open a
+          second gap. */}
+      <div className="px-3 pt-1 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
         {/* Slash-command autocomplete popover (#7137) */}
         {showCommandHint && matchedCommands.length > 0 && (
           <div className="relative max-w-4xl mx-auto">
@@ -854,95 +876,105 @@ export function AgentChatInner({
             </div>
           </div>
         )}
-        <div className="flex items-end gap-3 max-w-4xl mx-auto">
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="image/*"
-            multiple
-            className="hidden"
-            onChange={(e) => {
-              if (e.target.files) void uploadImages(e.target.files);
-              // Reset so picking the same file again re-fires onChange.
-              e.target.value = '';
-            }}
-          />
-          <Button
-            variant="ghost"
-            size="md"
-            onClick={() => fileInputRef.current?.click()}
-            disabled={uploading}
-            className="flex-shrink-0 w-10 px-0"
-            aria-label={t('agent.attach_image')}
-            title={t('agent.attach_image')}
-          >
-            {uploading
-              ? <Loader2 className="h-4 w-4 animate-spin" />
-              : <ImagePlus className="h-4 w-4" />}
-          </Button>
-          <textarea
-            ref={inputRef}
-            rows={1}
-            value={input}
-            onChange={handleTextareaChange}
-            onKeyDown={handleKeyDown}
-            onCompositionStart={() => { isComposingRef.current = true; }}
-            onCompositionEnd={() => { isComposingRef.current = false; }}
-            placeholder={!connected
-              ? t('agent.connecting')
-              : !hydrated
-                ? t('agent.session_loading')
-                : typing
-                  ? t('agent.running')
-                  : t('agent.type_message')}
-            disabled={!connected || typing || !hydrated}
-            className="flex-1 px-4 text-sm resize-none rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-muted transition-colors focus:outline-none focus:border-pc-accent focus:ring-2 focus:ring-pc-accent/30 disabled:opacity-40"
-            style={{ minHeight: '40px', maxHeight: '200px', paddingTop: '9px', paddingBottom: '9px' }}
-          />
-          {typing ? (
-            <Button
-              variant="danger"
-              size="md"
-              onClick={handleAbort}
-              className="flex-shrink-0 w-10 px-0"
-              aria-label={t('agent.stop')}
-              title={t('agent.stop')}
-            >
-              <Square className="h-4 w-4" fill="currentColor" />
-            </Button>
-          ) : (
-            <Button
-              variant="primary"
-              size="md"
-              onClick={handleSend}
-              disabled={!connected || !hydrated || !input.trim()}
-              className="flex-shrink-0 w-10 px-0"
-              aria-label={t('agent.send')}
-            >
-              <Send className="h-4 w-4" />
-            </Button>
-          )}
-        </div>
-        <div className="flex items-center justify-between mt-2 gap-2 max-w-4xl mx-auto">
-          <div className="flex items-center gap-2">
-            <span
-              className="status-dot"
-              style={typing
-                ? { background: 'var(--pc-accent)', boxShadow: '0 0 6px var(--pc-accent)' }
-                : connected
-                  ? { background: 'var(--color-status-success)', boxShadow: '0 0 6px var(--color-status-success)' }
-                  : { background: 'var(--color-status-error)', boxShadow: '0 0 6px var(--color-status-error)' }
-              }
+        <div className="max-w-4xl mx-auto">
+          {/* One field, not a field with satellites: the attach and send/stop
+              controls live inside the input's own border, so the composer
+              reads as a single line of UI and the buttons cost no extra
+              height. */}
+          <div className="flex items-end gap-1 rounded-[var(--radius-lg)] border border-pc-border bg-pc-input px-1.5 py-1.5 transition-colors focus-within:border-pc-accent focus-within:ring-2 focus-within:ring-pc-accent/30">
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*"
+              multiple
+              className="hidden"
+              onChange={(e) => {
+                if (e.target.files) void uploadImages(e.target.files);
+                // Reset so picking the same file again re-fires onChange.
+                e.target.value = '';
+              }}
             />
-            <span className="text-[10px]" style={{ color: 'var(--pc-text-faint)' }}>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={uploading}
+              className="flex-shrink-0 w-8 h-8 px-0"
+              aria-label={t('agent.attach_image')}
+              title={t('agent.attach_image')}
+            >
+              {uploading
+                ? <Loader2 className="h-4 w-4 animate-spin" />
+                : <ImagePlus className="h-4 w-4" />}
+            </Button>
+            <textarea
+              ref={inputRef}
+              rows={1}
+              value={input}
+              onChange={handleTextareaChange}
+              onKeyDown={handleKeyDown}
+              onCompositionStart={() => { isComposingRef.current = true; }}
+              onCompositionEnd={() => { isComposingRef.current = false; }}
+              placeholder={!connected
+                ? t('agent.connecting')
+                : !hydrated
+                  ? t('agent.session_loading')
+                  : typing
+                    ? t('agent.running')
+                    : t('agent.type_message')}
+              disabled={!connected || typing || !hydrated}
+              className="flex-1 min-w-0 bg-transparent px-1 text-sm text-pc-text resize-none placeholder:text-pc-text-muted focus:outline-none disabled:opacity-40"
+              style={{ minHeight: '32px', maxHeight: '200px', paddingTop: '6px', paddingBottom: '6px' }}
+            />
+            {typing ? (
+              <Button
+                variant="danger"
+                size="sm"
+                onClick={handleAbort}
+                className="flex-shrink-0 w-8 h-8 px-0"
+                aria-label={t('agent.stop')}
+                title={t('agent.stop')}
+              >
+                <Square className="h-3.5 w-3.5" fill="currentColor" />
+              </Button>
+            ) : (
+              <Button
+                variant="primary"
+                size="sm"
+                onClick={handleSend}
+                disabled={!connected || !hydrated || !input.trim()}
+                className="flex-shrink-0 w-8 h-8 px-0"
+                aria-label={t('agent.send')}
+              >
+                <Send className="h-4 w-4" />
+              </Button>
+            )}
+          </div>
+
+          {/* Status, centered under the field, carried by the pill's own color
+              — a dot plus a label said the same thing twice and took a row.
+              The context meter keeps the far right of that row, where it stays
+              out of the centered pill's way on a phone. */}
+          <div className="relative mt-2 flex items-center justify-center">
+            <span
+              className={`rounded-full px-2.5 py-0.5 text-[10px] font-medium ${
+                typing
+                  ? 'bg-pc-accent/15 text-pc-accent'
+                  : connected
+                    ? 'bg-status-success/15 text-status-success'
+                    : 'bg-status-error/15 text-status-error'
+              }`}
+            >
               {typing
                 ? t('agent.running')
                 : connected
                   ? t('agent.connected_status')
                   : t('agent.disconnected_status')}
             </span>
+            <div className="absolute right-0">
+              <ContextBar contextMaxTokens={contextMaxTokens} contextModelWindow={contextModelWindow} contextInputTokens={contextInputTokens} />
+            </div>
           </div>
-          <ContextBar contextMaxTokens={contextMaxTokens} contextModelWindow={contextModelWindow} contextInputTokens={contextInputTokens} />
         </div>
       </div>
     </div>

@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ChevronDown, ChevronUp } from 'lucide-react';
 import { AgentProvider } from '@/contexts/AgentContext';
 import { AgentChatInner, type AgentChatStatus } from '@/pages/AgentChat';
 import { ChatTabBar, type TabIndicator, type WorkspaceLayout } from '@/components/ChatTabBar';
+import { t } from '@/lib/i18n';
 import { basePath } from '@/lib/basePath';
 import {
   applySessionChange,
@@ -25,6 +27,26 @@ interface PaneStatus {
   streaming: boolean;
   /** New messages arrived while this alias was hidden. */
   unread: boolean;
+}
+
+/** Where the operator's choice of the workspace chrome lives. */
+const CHROME_KEY = 'zeroclaw_workspace_chrome';
+
+/**
+ * Whether the workspace chrome (tab bar + pane pickers and toolbar) starts
+ * open. An explicit choice always wins; with none, a narrow viewport starts
+ * collapsed — on a phone those rows cost the transcript a sixth of the screen —
+ * and a wide one starts expanded, where there is room for both.
+ */
+function initialChromeOpen(): boolean {
+  try {
+    const stored = localStorage.getItem(CHROME_KEY);
+    if (stored === '1') return true;
+    if (stored === '0') return false;
+  } catch { /* storage unavailable: fall through to the viewport default */ }
+  return typeof window === 'undefined'
+    ? true
+    : window.matchMedia('(min-width: 640px)').matches;
 }
 
 export interface ChatWorkspaceProps {
@@ -63,6 +85,19 @@ export default function ChatWorkspace({ initialAlias, initialSessionId }: ChatWo
   const [splitKeys, setSplitKeys] = useState<[string, string | null]>(
     persisted.current.splitKeys ?? ['', null],
   );
+  // Whether the chrome rows are shown. One toggle for the whole workspace: the
+  // tab bar above the panes and every pane's own header pickers + toolbar, so a
+  // phone can hand the transcript the entire viewport and still reach all of it
+  // from the handle row below.
+  const [chromeOpen, setChromeOpen] = useState<boolean>(initialChromeOpen);
+
+  const toggleChrome = useCallback(() => {
+    setChromeOpen((prev) => {
+      const next = !prev;
+      try { localStorage.setItem(CHROME_KEY, next ? '1' : '0'); } catch { /* noop */ }
+      return next;
+    });
+  }, []);
 
   const tabsRef = useRef(tabs);
   useEffect(() => { tabsRef.current = tabs; }, [tabs]);
@@ -347,17 +382,45 @@ export default function ChatWorkspace({ initialAlias, initialSessionId }: ChatWo
 
   return (
     <div translate="no" className="notranslate flex flex-col h-full min-h-0">
-      <ChatTabBar
-        tabs={labelledTabs}
-        activeKey={activeTab?.key ?? ''}
-        indicators={indicators}
-        layout={effectiveLayout}
-        splitDisabled={splitDisabled}
-        onSelect={selectTab}
-        onClose={closeChat}
-        onOpen={openChat}
-        onToggleLayout={toggleLayout}
-      />
+      {chromeOpen && (
+        <ChatTabBar
+          tabs={labelledTabs}
+          activeKey={activeTab?.key ?? ''}
+          indicators={indicators}
+          layout={effectiveLayout}
+          splitDisabled={splitDisabled}
+          onSelect={selectTab}
+          onClose={closeChat}
+          onOpen={openChat}
+          onToggleLayout={toggleLayout}
+        />
+      )}
+
+      {/* The handle's own row. A real row rather than a floating tab: a phone
+          right-aligns messages exactly under the top-right corner, so a
+          floating handle would sit on the first bubble. It is 28px, and while
+          the chrome is collapsed it also carries what the hidden tab bar was
+          saying — which chat is on screen, and whether it is busy or has news. */}
+      <div
+        className={`flex h-7 shrink-0 items-center gap-2 bg-pc-surface px-2 ${
+          chromeOpen ? '' : 'border-b border-pc-border'
+        }`}
+      >
+        {!chromeOpen && (
+          <>
+            <LiveDot
+              streaming={!!indicators[activeTab?.key ?? '']?.streaming}
+              unread={Object.entries(indicators).some(
+                ([key, ind]) => ind.unread && key !== activeTab?.key,
+              )}
+            />
+            <span className="min-w-0 truncate text-[11px] text-pc-text-secondary">
+              {activeTab?.key ? (labelledTabs.find((tb) => tb.key === activeTab.key)?.label ?? '') : ''}
+            </span>
+          </>
+        )}
+        <ChromeHandle open={chromeOpen} onToggle={toggleChrome} />
+      </div>
 
       {/* Content area. Every open chat is mounted here at all times; only CSS
           visibility changes between tab/layout switches, so background sockets
@@ -395,12 +458,54 @@ export default function ChatWorkspace({ initialAlias, initialSessionId }: ChatWo
                 reservedSessionIds={reservedByKey[tab.key]}
                 onSessionChange={onSessionChangeFor(tab.key)}
               >
-                <AgentChatInner agentAlias={tab.alias} onStatus={onStatusFor(tab.key)} />
+                <AgentChatInner
+                  agentAlias={tab.alias}
+                  onStatus={onStatusFor(tab.key)}
+                  showChrome={chromeOpen}
+                />
               </AgentProvider>
             </div>
           );
         })}
       </div>
     </div>
+  );
+}
+
+/**
+ * The chrome handle: the control that opens and closes the workspace chrome
+ * (the tab bar, every pane's pickers and the action toolbar). It sits at the
+ * right end of the handle row, so it reads as that row's own tab.
+ */
+function ChromeHandle({ open, onToggle }: { open: boolean; onToggle: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      aria-expanded={open}
+      aria-label={t('agent.chat_panel_toggle')}
+      title={t('agent.chat_panel_toggle')}
+      className="ml-auto flex h-6 w-9 shrink-0 items-center justify-center rounded-[var(--radius-md)] border border-pc-border text-pc-text-muted transition-colors hover:bg-[var(--pc-hover)] hover:text-pc-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
+    >
+      {open ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+    </button>
+  );
+}
+
+/**
+ * What the collapsed chrome still has to say: a pulsing dot while the shown
+ * chat is mid-turn, a solid one when a hidden chat received messages.
+ */
+function LiveDot({ streaming, unread }: { streaming: boolean; unread: boolean }) {
+  if (!streaming && !unread) {
+    return (
+      <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-pc-text-faint/40" aria-hidden />
+    );
+  }
+  return (
+    <span
+      className={`h-1.5 w-1.5 shrink-0 rounded-full bg-pc-accent ${streaming ? 'animate-pulse' : ''}`}
+      aria-hidden
+    />
   );
 }

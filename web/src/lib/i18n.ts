@@ -1523,6 +1523,7 @@ const translations: Record<Locale, Record<string, string>> = {
 
     // Agent / Chat
     'agent.title': 'Agent Chat',
+    'agent.chat_panel_toggle': 'Chats and settings',
     'agent.send': 'Send',
     'agent.placeholder': 'Type a message...',
     'agent.start_conversation': 'Send a message to start the conversation',
@@ -11337,6 +11338,7 @@ const translations: Record<Locale, Record<string, string>> = {
 
     // Agent / Chat
     'agent.title': 'Чат с агентом',
+    'agent.chat_panel_toggle': 'Чаты и настройки',
     'agent.send': 'Отправить',
     'agent.placeholder': 'Введите сообщение...',
     'agent.start_conversation': 'Отправьте сообщение, чтобы начать разговор',
