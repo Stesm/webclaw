@@ -836,16 +836,18 @@ export function AgentChatInner({
         />
       )}
 
-      {/* Input area. No panel background and no top border: the transcript
-          keeps the surface it already owns, so a phone spends its height on
-          messages instead of on a block of chrome. The bottom safe-area inset
-          is padding, not height: with `viewport-fit=cover` the composer would
-          otherwise sit under the home indicator of an installed PWA and the
-          system gesture would steal the tap. `max()` rather than a sum — the
-          app is already sized to the dynamic viewport, so the inset is the
-          whole allowance and adding the usual padding on top would open a
-          second gap. */}
-      <div className="px-3 pt-1 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+      {/* Input area. The block itself paints nothing: no background, no top
+          border, so the bottom of the chat is the transcript's own surface.
+          The two things that do carry a background are the field and the
+          status pill — and the field is the input: the attach and send/stop
+          controls live inside its border, so they cost no height of their own.
+          The bottom safe-area inset is padding, not height: with
+          `viewport-fit=cover` the composer would otherwise sit under the home
+          indicator of an installed PWA and the system gesture would steal the
+          tap. `max()` rather than a sum — the app is already sized to the
+          dynamic viewport, so the inset is the whole allowance and adding the
+          usual padding on top would open a second gap. */}
+      <div className="bg-transparent px-3 pt-1 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
         {/* Slash-command autocomplete popover (#7137) */}
         {showCommandHint && matchedCommands.length > 0 && (
           <div className="relative max-w-4xl mx-auto">
@@ -880,10 +882,11 @@ export function AgentChatInner({
           {/* One field, not a field with satellites: the attach and send/stop
               controls live inside the input's own border, so the composer
               reads as a single line of UI and the buttons cost no extra
-              height. The field carries no fill of its own either: the outline
-              and the focus ring are the whole affordance, so the bottom of the
-              chat stays the same surface as the transcript above it. */}
-          <div className="flex items-end gap-1 rounded-[var(--radius-lg)] border border-pc-border px-1.5 py-1.5 transition-colors focus-within:border-pc-accent focus-within:ring-2 focus-within:ring-pc-accent/30">
+              height. `appearance-none` on every control in it is deliberate:
+              iOS Safari gives a form control its own native backing and border
+              otherwise, which showed up on the phone as an opaque plaque
+              inside this block that no stylesheet of ours had painted. */}
+          <div className="flex items-end gap-1 rounded-[var(--radius-lg)] border border-pc-border bg-pc-input px-1.5 py-1.5 transition-colors focus-within:border-pc-accent focus-within:ring-2 focus-within:ring-pc-accent/30">
             <input
               ref={fileInputRef}
               type="file"
@@ -901,7 +904,7 @@ export function AgentChatInner({
               size="sm"
               onClick={() => fileInputRef.current?.click()}
               disabled={uploading}
-              className="flex-shrink-0 w-8 h-8 px-0"
+              className="flex-shrink-0 w-8 h-8 px-0 appearance-none"
               aria-label={t('agent.attach_image')}
               title={t('agent.attach_image')}
             >
@@ -925,7 +928,7 @@ export function AgentChatInner({
                     ? t('agent.running')
                     : t('agent.type_message')}
               disabled={!connected || typing || !hydrated}
-              className="flex-1 min-w-0 bg-transparent px-1 text-sm text-pc-text resize-none placeholder:text-pc-text-muted focus:outline-none disabled:opacity-40"
+              className="flex-1 min-w-0 appearance-none bg-transparent px-1 text-sm text-pc-text resize-none placeholder:text-pc-text-muted focus:outline-none disabled:opacity-40"
               style={{ minHeight: '32px', maxHeight: '200px', paddingTop: '6px', paddingBottom: '6px' }}
             />
             {typing ? (
@@ -933,7 +936,7 @@ export function AgentChatInner({
                 variant="danger"
                 size="sm"
                 onClick={handleAbort}
-                className="flex-shrink-0 w-8 h-8 px-0"
+                className="flex-shrink-0 w-8 h-8 px-0 appearance-none"
                 aria-label={t('agent.stop')}
                 title={t('agent.stop')}
               >
@@ -945,7 +948,7 @@ export function AgentChatInner({
                 size="sm"
                 onClick={handleSend}
                 disabled={!connected || !hydrated || !input.trim()}
-                className="flex-shrink-0 w-8 h-8 px-0"
+                className="flex-shrink-0 w-8 h-8 px-0 appearance-none"
                 aria-label={t('agent.send')}
               >
                 <Send className="h-4 w-4" />
