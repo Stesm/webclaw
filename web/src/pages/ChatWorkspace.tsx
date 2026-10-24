@@ -44,7 +44,7 @@ function initialChromeOpen(): boolean {
     if (stored === '1') return true;
     if (stored === '0') return false;
   } catch { /* storage unavailable: fall through to the viewport default */ }
-  return typeof window === 'undefined'
+  return typeof window === 'undefined' || typeof window.matchMedia !== 'function'
     ? true
     : window.matchMedia('(min-width: 640px)').matches;
 }

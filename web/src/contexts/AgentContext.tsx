@@ -460,6 +460,23 @@ export function AgentProvider({
           setBackgroundTurn(true);
           setTyping(true);
           setLiveProgress(msg.progress ?? null);
+        } else if (typingRef.current || backgroundTurnRef.current) {
+          // This socket attached to a session with no live turn while the pane
+          // still believed one was running: its own socket dropped mid-turn
+          // (a phone that backgrounded the app) and the turn finished
+          // unattended. Nothing will say so — `done` goes to the socket that
+          // ran the turn, and `turn_done` was broadcast while nobody held one —
+          // so the pane would show a spinner, and later the thinking dots, for
+          // a turn that is already over. Leave the viewer state and pull the
+          // transcript the finished turn persisted.
+          backgroundTurnRef.current = false;
+          setBackgroundTurn(false);
+          setLiveProgress(null);
+          foldTurnStream({ type: 'reset' });
+          setStreamingContent('');
+          setStreamingThinking('');
+          setTyping(false);
+          void refreshTranscript(true);
         }
         break;
 

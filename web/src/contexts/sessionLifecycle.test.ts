@@ -527,6 +527,61 @@ test('switching away from a streaming conversation does not abort its turn', asy
   await unmount(mounted.renderer);
 });
 
+test('a socket that reattaches with no live turn settles the pane and re-pulls the transcript', async () => {
+  const runtime = new FakeSessionRuntime();
+  const mounted = await mountChat(runtime);
+  await openSocket(runtime, 0);
+  await settle();
+  const sid = mounted.context().sessionId;
+
+  // A turn of this pane's own is streaming when its socket drops — what a phone
+  // does the moment the app goes to the background.
+  await act(async () => { mounted.context().sendMessage('long running task'); });
+  await act(async () => {
+    runtime.sockets[0]!.emitMessage({ type: 'chunk', content: 'working' });
+  });
+  await settle();
+  assert.equal(mounted.context().typing, true);
+  await act(async () => { runtime.sockets[0]!.emitClose(); });
+
+  // The turn finished unattended: `done` went to the socket that was gone, and
+  // `turn_done` was broadcast while nobody held the session. The pane is left
+  // believing the turn still runs, so it renders a spinner — and then the
+  // thinking dots — for a turn that is over, until the operator re-enters the
+  // chat. The gateway says otherwise in `session_start`: `running: false`.
+  runtime.queueMessages(sid, () =>
+    Promise.resolve(messagesResponse(sid, true, ['a snapshot from before the answer'])));
+  runtime.queueMessages(sid, () =>
+    Promise.resolve(messagesResponse(sid, true, [
+      'long running task',
+      'the answer that landed while nobody watched',
+    ])));
+
+  // The reconnect's own refresh may not touch a live stream, so it must not be
+  // what settles this: the pane still believes it is typing, and the snapshot
+  // it would have pulled is not applied.
+  await openSocket(runtime, 0);
+  await settle();
+  assert.equal(mounted.context().typing, true);
+  assert.deepEqual(
+    mounted.context().messages.map((message) => message.content),
+    ['long running task'],
+  );
+
+  // The gateway's own report is what settles it.
+  await act(async () => {
+    runtime.sockets[0]!.emitMessage({ type: 'session_start', session_id: sid, running: false });
+  });
+  await settle();
+
+  assert.equal(mounted.context().typing, false);
+  assert.deepEqual(
+    mounted.context().messages.map((message) => message.content),
+    ['long running task', 'the answer that landed while nobody watched'],
+  );
+  await unmount(mounted.renderer);
+});
+
 test('switch resets capability, hydrates the target, and ignores the old socket', async () => {
   const runtime = new FakeSessionRuntime();
   const bHydration = new Deferred<SessionMessagesResponse>();

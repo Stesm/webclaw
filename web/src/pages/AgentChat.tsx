@@ -266,6 +266,9 @@ export function AgentChatInner({
       setComposerHeight(el.offsetHeight);
     };
     update();
+    // Not every environment has the observer (a DOM-less test renderer does
+    // not); the height is then simply whatever the first measurement said.
+    if (typeof ResizeObserver === 'undefined') return;
     const observer = new ResizeObserver(update);
     observer.observe(el);
     return () => observer.disconnect();
