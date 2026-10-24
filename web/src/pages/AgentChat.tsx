@@ -998,6 +998,12 @@ export function AgentChatInner({
                 ? <Loader2 className="h-4 w-4 animate-spin" />
                 : <ImagePlus className="h-4 w-4" />}
             </Button>
+            {/* `outline` is inline, not just a utility: the app's global
+                `:focus-visible` ring (index.css) outranks Tailwind's
+                `focus:outline-none` here, and Safari treats a text field as
+                focus-visible even on a tap — so the ring appeared inside the
+                field, reading as a second outline next to the field's own
+                accent border. The border is the focus indicator. */}
             <textarea
               ref={inputRef}
               rows={1}
@@ -1014,8 +1020,8 @@ export function AgentChatInner({
                     ? t('agent.running')
                     : t('agent.type_message')}
               disabled={!connected || typing || !hydrated}
-              className="flex-1 min-w-0 appearance-none bg-transparent px-1 text-sm text-pc-text resize-none placeholder:text-pc-text-muted focus:outline-none disabled:opacity-40"
-              style={{ minHeight: '32px', maxHeight: '200px', paddingTop: '6px', paddingBottom: '6px' }}
+              className="flex-1 min-w-0 appearance-none bg-transparent px-1 text-sm text-pc-text resize-none placeholder:text-pc-text-muted disabled:opacity-40"
+              style={{ minHeight: '32px', maxHeight: '200px', paddingTop: '6px', paddingBottom: '6px', outline: 'none' }}
             />
             {typing ? (
               <Button
