@@ -927,7 +927,7 @@ export function AgentChatInner({
         {pendingApproval && (
           <ApprovalBanner pending={pendingApproval} onRespond={respondToApproval} />
         )}
-        <div className="bg-transparent px-3 pt-1 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+        <div className="bg-transparent px-3 pt-1 pb-[max(0.5rem,calc(env(safe-area-inset-bottom)-1.125rem))]">
         {/* Slash-command autocomplete popover (#7137) */}
         {showCommandHint && matchedCommands.length > 0 && (
           <div className="relative max-w-4xl mx-auto">
@@ -965,8 +965,11 @@ export function AgentChatInner({
               height. `appearance-none` on every control in it is deliberate:
               iOS Safari gives a form control its own native backing and border
               otherwise, which showed up on the phone as an opaque plaque
-              inside this block that no stylesheet of ours had painted. */}
-          <div className="flex items-end gap-1 rounded-[var(--radius-lg)] border border-pc-border bg-pc-input px-1.5 py-1.5 transition-colors focus-within:border-pc-accent focus-within:ring-2 focus-within:ring-pc-accent/30">
+              inside this block that no stylesheet of ours had painted.
+              At rest the field is translucent so the transcript under it stays
+              readable; focus is the single highlight — an accent border, no
+              separate ring, which read as a second outline on the phone. */}
+          <div className="flex items-end gap-1 rounded-[var(--radius-lg)] border border-pc-border bg-pc-input px-1.5 py-1.5 opacity-70 transition-[opacity,background-color,border-color] focus-within:border-pc-accent focus-within:bg-pc-input focus-within:opacity-100">
             <input
               ref={fileInputRef}
               type="file"
