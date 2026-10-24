@@ -242,6 +242,44 @@ export function AgentChatInner({
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const modelDropdownRef = useRef<HTMLDivElement>(null);
+  // The composer floats over the transcript, so the scroll area reserves its
+  // height at the end of the content (see the sentinel below). Measured rather
+  // than assumed: the field grows with what is typed, and the status line and
+  // the safe-area inset are part of the block.
+  const composerRef = useRef<HTMLDivElement>(null);
+  const [composerHeight, setComposerHeight] = useState(0);
+  const messagesRef = useRef<HTMLDivElement>(null);
+  // Whether the reader was at the bottom *before* the composer changed size.
+  // Read there, not in the effect below: by the time the effect runs the
+  // sentinel has already grown, and the distance to the bottom with it.
+  const wasAtBottomRef = useRef(true);
+
+  useEffect(() => {
+    const el = composerRef.current;
+    if (!el) return;
+    const update = () => {
+      const scroller = messagesRef.current;
+      if (scroller) {
+        wasAtBottomRef.current =
+          scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop < 64;
+      }
+      setComposerHeight(el.offsetHeight);
+    };
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
+  // The field grows upward as the operator types, which would let it cover the
+  // newest message on a reader parked at the bottom. Growth lands here (after
+  // the sentinel has taken the new height), and only a reader who was already
+  // at the bottom is moved with it — scrolling up to read is not interrupted.
+  useEffect(() => {
+    const scroller = messagesRef.current;
+    if (!scroller || !wasAtBottomRef.current) return;
+    scroller.scrollTop = scroller.scrollHeight;
+  }, [composerHeight]);
 
   // AgentChatInner stays mounted while the selected conversation changes.
   // Load that conversation's draft explicitly; useState's initializer only ran
@@ -262,8 +300,11 @@ export function AgentChatInner({
   // Note: WebSocket lifecycle, hydration, and tool_call/tool_result handling
   // moved to AgentContext (PR #6101). Tool activity is filtered at render
   // time below using `showToolActivity`, not at the message-handler layer.
+  // `block: 'end'` matters now that the sentinel is as tall as the floating
+  // composer: aligning its bottom with the scrollport's bottom leaves exactly
+  // that much space under the newest message, where the field sits.
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
   }, [messages, typing, streamingContent]);
 
   // Map the polled snapshot to live rows. `turnProgressToUiMessages` derives
@@ -761,8 +802,11 @@ export function AgentChatInner({
         </div>
       )}
 
-      {/* Messages area. */}
+      {/* Messages area. It spans the pane's whole height: the composer floats
+          over it, so the transcript — and the empty-state block below — reads
+          to the bottom of the page instead of stopping above the field. */}
       <div
+        ref={messagesRef}
         className={`flex-1 overflow-y-auto p-4 ${compact ? 'space-y-1.5' : 'space-y-4'}`}
       >
         {messages.length === 0 && (
@@ -846,13 +890,8 @@ export function AgentChatInner({
           </div>
         )}
 
-        <div ref={messagesEndRef} />
+        <div ref={messagesEndRef} style={{ height: composerHeight || undefined }} />
       </div>
-
-      {/* Tool approval banner — supervised-mode consent prompt (#6522). */}
-      {pendingApproval && (
-        <ApprovalBanner pending={pendingApproval} onRespond={respondToApproval} />
-      )}
 
       {previewAttachment && (
         <AttachmentPreviewModal
@@ -862,18 +901,33 @@ export function AgentChatInner({
         />
       )}
 
-      {/* Input area. The block itself paints nothing: no background, no top
-          border, so the bottom of the chat is the transcript's own surface.
-          The two things that do carry a background are the field and the
-          status pill — and the field is the input: the attach and send/stop
-          controls live inside its border, so they cost no height of their own.
-          The bottom safe-area inset is padding, not height: with
-          `viewport-fit=cover` the composer would otherwise sit under the home
-          indicator of an installed PWA and the system gesture would steal the
-          tap. `max()` rather than a sum — the app is already sized to the
-          dynamic viewport, so the inset is the whole allowance and adding the
-          usual padding on top would open a second gap. */}
-      <div className="bg-transparent px-3 pt-1 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+      {/* Input area, floating over the transcript: the messages scroll the pane's
+          whole height and pass under this, so a bubble is visible next to and
+          below the field instead of the chat stopping above it. The sentinel at
+          the end of the transcript is as tall as this block, which is what keeps
+          the newest message clear of the field when the reader is at the bottom.
+          The block itself paints nothing: no background, no top border, so the
+          bottom of the chat is the transcript's own surface. The two things that
+          do carry a background are the field and the status pill — and the field
+          is the input: the attach and send/stop controls live inside its border,
+          so they cost no height of their own. The bottom safe-area inset is
+          padding, not height: with `viewport-fit=cover` the composer would
+          otherwise sit under the home indicator of an installed PWA and the
+          system gesture would steal the tap. `max()` rather than a sum — the app
+          is already sized to the dynamic viewport, so the inset is the whole
+          allowance and adding the usual padding on top would open a second
+          gap. */}
+      <div
+        ref={composerRef}
+        className="absolute inset-x-0 bottom-0 z-20 flex flex-col bg-transparent"
+      >
+        {/* Tool approval banner — supervised-mode consent prompt (#6522).
+            Inside the overlay so a parked approval stays above the field it
+            would otherwise be covered by. */}
+        {pendingApproval && (
+          <ApprovalBanner pending={pendingApproval} onRespond={respondToApproval} />
+        )}
+        <div className="bg-transparent px-3 pt-1 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
         {/* Slash-command autocomplete popover (#7137) */}
         {showCommandHint && matchedCommands.length > 0 && (
           <div className="relative max-w-4xl mx-auto">
@@ -1007,6 +1061,7 @@ export function AgentChatInner({
             </div>
           </div>
         </div>
+      </div>
       </div>
     </div>
   );
