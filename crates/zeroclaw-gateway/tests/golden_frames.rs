@@ -42,6 +42,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::Message;
 
+use zeroclaw_config::autonomy::AutonomyLevel;
 use zeroclaw_config::multi_agent::{AgentMemoryConfig, AgentWorkspaceConfig, MemoryBackendKind};
 use zeroclaw_config::schema::{
     AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig, RiskProfileConfig,
@@ -60,9 +61,18 @@ const AGENT: &str = "web";
 enum Reply {
     /// Assistant text, streamed word by word when the request streams.
     Text(&'static str),
+    /// A native tool call, so the scripted turn can exercise a real tool (and
+    /// whatever the gateway does with its result) before the next reply.
+    ToolCall {
+        name: &'static str,
+        arguments: &'static str,
+    },
     /// An HTTP error status with a JSON error body.
     Status(u16),
 }
+
+/// Stable tool-call id the scripted provider emits for [`Reply::ToolCall`].
+const SCRIPTED_TOOL_CALL_ID: &str = "call_golden_scripted";
 
 struct ScriptedProvider {
     addr: SocketAddr,
@@ -120,16 +130,65 @@ impl Drop for ScriptedProvider {
 }
 
 fn provider_response(reply: &Reply, stream: bool) -> Response {
-    let text = match reply {
-        Reply::Status(code) => {
-            let status = StatusCode::from_u16(*code).expect("scripted status code");
-            let body =
-                json!({"error": {"message": "scripted provider failure", "type": "server_error"}});
-            return (status, axum::Json(body)).into_response();
-        }
-        Reply::Text(text) => *text,
-    };
     let usage = json!({"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15});
+    if let Reply::Status(code) = reply {
+        let status = StatusCode::from_u16(*code).expect("scripted status code");
+        let body =
+            json!({"error": {"message": "scripted provider failure", "type": "server_error"}});
+        return (status, axum::Json(body)).into_response();
+    }
+    if let Reply::ToolCall { name, arguments } = reply {
+        if !stream {
+            let body = json!({
+                "id": "chatcmpl-golden",
+                "object": "chat.completion",
+                "model": "fixture-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": Value::Null,
+                        "tool_calls": [{
+                            "id": SCRIPTED_TOOL_CALL_ID,
+                            "type": "function",
+                            "function": {"name": *name, "arguments": *arguments},
+                        }],
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": usage,
+            });
+            return axum::Json(body).into_response();
+        }
+        let mut sse = String::new();
+        let open = json!({"id": "chatcmpl-golden", "model": "fixture-model", "choices": [{
+            "index": 0,
+            "delta": {"role": "assistant", "tool_calls": [{
+                "index": 0,
+                "id": SCRIPTED_TOOL_CALL_ID,
+                "type": "function",
+                "function": {"name": *name, "arguments": ""},
+            }]},
+        }]});
+        sse.push_str(&format!("data: {open}\n\n"));
+        let args = json!({"id": "chatcmpl-golden", "model": "fixture-model", "choices": [{
+            "index": 0,
+            "delta": {"tool_calls": [{"index": 0, "function": {"arguments": *arguments}}]},
+        }]});
+        sse.push_str(&format!("data: {args}\n\n"));
+        let last = json!({"id": "chatcmpl-golden", "model": "fixture-model",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}], "usage": usage});
+        sse.push_str(&format!("data: {last}\n\ndata: [DONE]\n\n"));
+        return (
+            [(header::CONTENT_TYPE, "text/event-stream")],
+            Body::from(sse),
+        )
+            .into_response();
+    }
+    let text = match reply {
+        Reply::Text(text) => *text,
+        Reply::ToolCall { .. } | Reply::Status(_) => unreachable!("handled above"),
+    };
     if !stream {
         let body = json!({
             "id": "chatcmpl-golden",
@@ -176,8 +235,15 @@ struct Gateway {
 
 impl Gateway {
     async fn start(provider: &ScriptedProvider) -> Self {
+        Self::start_with(provider, fixture_config).await
+    }
+
+    /// Starts a gateway whose config is built by `build`. This lets a scenario
+    /// grant a tool or a file the shared `fixture_config` does not, without
+    /// touching the golden transcripts of the scenarios that share it.
+    async fn start_with(provider: &ScriptedProvider, build: fn(&Path, &str) -> Config) -> Self {
         let root = tempfile::TempDir::new().expect("gateway temp root");
-        let config = fixture_config(root.path(), &provider.base_url());
+        let config = build(root.path(), &provider.base_url());
 
         let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("probe free port");
         let port = probe.local_addr().expect("probe address").port();
@@ -289,6 +355,33 @@ fn fixture_config(root: &Path, provider_url: &str) -> Config {
             ..AliasedAgentConfig::default()
         },
     );
+    config
+}
+
+/// The shared fixture, plus everything a turn needs to hand the operator a
+/// real file: `deliver_file` admitted and freed from approval, native tool
+/// calls on, room for the tool round and its closing answer, and a file to
+/// deliver.
+fn attachment_fixture_config(root: &Path, provider_url: &str) -> Config {
+    let mut config = fixture_config(root, provider_url);
+    let workspace = config.agent_workspace_dir(AGENT);
+    std::fs::write(workspace.join("report.txt"), "golden report\n").expect("fixture deliverable");
+    let profile = config
+        .risk_profiles
+        .get_mut("fixture")
+        .expect("fixture risk profile");
+    // The file-delivery tool is the one under test; full autonomy keeps the
+    // turn from parking on an approval no golden client can answer.
+    profile.level = AutonomyLevel::Full;
+    profile.allowed_tools.push("deliver_file".to_string());
+    config
+        .runtime_profiles
+        .get_mut("fixture")
+        .expect("fixture runtime profile")
+        .max_tool_iterations = 4;
+    if let Some(provider) = config.providers.models.custom.get_mut("fixture") {
+        provider.base.native_tools = Some(true);
+    }
     config
 }
 
@@ -560,6 +653,46 @@ where
         .expect("spawn scenario thread")
         .join()
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+/// Like `run_scenario`, but without a golden fixture: returns the collected
+/// transcript so a test can assert on the wire frames directly. It runs on the
+/// same large-stack thread, because constructing a runtime agent overflows the
+/// default test-thread stack.
+fn run_wire<F, Fut>(script: Vec<Reply>, build: fn(&Path, &str) -> Config, body: F) -> Transcript
+where
+    F: FnOnce(SocketAddr, Transcript) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Transcript>,
+{
+    let _serial = SCENARIO_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::thread::Builder::new()
+        .name("golden-wire".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_stack_size(8 * 1024 * 1024)
+                .enable_all()
+                .build()
+                .expect("wire runtime");
+            runtime.block_on(async move {
+                let provider = ScriptedProvider::spawn(script).await;
+                let gateway = Gateway::start_with(&provider, build).await;
+                let transcript = tokio::time::timeout(
+                    Duration::from_secs(60),
+                    body(gateway.addr, Transcript::default()),
+                )
+                .await
+                .expect("wire scenario timed out");
+                gateway.stop().await;
+                transcript
+            })
+        })
+        .expect("spawn wire thread")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
 // ── Minimal HTTP/1.1 client ─────────────────────────────────────────────
@@ -871,6 +1004,40 @@ fn ws_chat_provider_error() {
         "ws_chat_provider_error",
         vec![Reply::Status(500)],
         |addr, t| async move { ws_chat_turn(addr, t, "golden-ws-error").await },
+    );
+}
+
+/// A WebSocket chat turn must hand the operator a file the agent delivers.
+/// `deliver_file` is gated on the turn's `acp_delivery` flag in the tool
+/// registry: when the gateway stops assembling the tool in, the model's call
+/// comes back "Unknown tool", no `tool_result` carries an attachment, and the
+/// operator silently loses the ability to receive any file. This asserts the
+/// wire, not the flag, so it fails the moment that assembly regresses.
+#[test]
+fn ws_chat_turn_transports_delivered_file() {
+    let transcript = run_wire(
+        vec![
+            Reply::ToolCall {
+                name: "deliver_file",
+                arguments: r#"{"path":"report.txt","title":"Golden report"}"#,
+            },
+            Reply::Text("Here is the report."),
+        ],
+        attachment_fixture_config,
+        |addr, t| async move { ws_chat_turn(addr, t, "golden-ws-attachment").await },
+    );
+    let attachment = transcript
+        .frames
+        .iter()
+        .filter(|frame| frame["dir"] == "recv" && frame["channel"] == "ws")
+        .filter_map(|frame| frame["payload"].get("attachment"))
+        .next()
+        .expect("the delivered file must reach the client as a tool_result attachment");
+    assert_eq!(attachment["filename"], "report.txt");
+    assert_eq!(attachment["title"], "Golden report");
+    assert!(
+        attachment["id"].as_str().is_some_and(|id| !id.is_empty()),
+        "attachment carries an opaque content-addressed id: {attachment}"
     );
 }
 

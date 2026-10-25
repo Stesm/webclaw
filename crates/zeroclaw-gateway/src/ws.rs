@@ -646,8 +646,13 @@ async fn handle_socket(
             Some(&session_cwd),
             true,
             false,
-            // The gateway WebSocket turn does not transport ACP file attachments.
-            false,
+            // The web WebSocket turn transports the typed file attachment
+            // `deliver_file` emits, framing it on `tool_result` and persisting
+            // it on the session message — so the tool must be registered here.
+            // `acp_delivery` gates exactly that tool in the tool registry, and
+            // dropping it silently removes the agent's ability to hand the
+            // operator any file at all.
+            true,
             state.sop_engine.clone(),
             state.sop_audit.clone(),
             Some(state.canvas_store.clone()),
