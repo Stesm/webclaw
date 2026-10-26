@@ -7993,6 +7993,17 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub web_dist_dir: Option<String>,
 
+    /// Extra origins whose images the dashboard chat may render inline.
+    /// Each entry is a bare HTTPS origin (`https://host` or
+    /// `https://host:port`); anything else (plain HTTP, a path, a wildcard)
+    /// is ignored. Empty by default, which keeps `img-src` same-origin plus
+    /// `data:`/`blob:` so agent-authored markdown cannot beacon to a
+    /// third-party host. Add an origin only when the agent embeds images it
+    /// publishes there (for example a chart host of your own). Read when the
+    /// gateway builds its router, so a change applies after a restart.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub csp_image_origins: Vec<String>,
+
     /// TLS configuration for the gateway server (`[gateway.tls]`).
     #[serde(default)]
     #[nested]
@@ -8102,6 +8113,7 @@ impl Default for GatewayConfig {
             pairing_code: PairingCodePolicy::default(),
             pairing_dashboard: PairingDashboardConfig::default(),
             web_dist_dir: None,
+            csp_image_origins: Vec::new(),
             tls: None,
             request_timeout_secs: default_gateway_request_timeout_secs(),
             long_running_request_timeout_secs: default_gateway_long_running_request_timeout_secs(),
@@ -36975,6 +36987,7 @@ allowed_numbers = ["+1", "+2"]
             pairing_code: PairingCodePolicy::default(),
             pairing_dashboard: PairingDashboardConfig::default(),
             web_dist_dir: None,
+            csp_image_origins: Vec::new(),
             tls: None,
             request_timeout_secs: 30,
             long_running_request_timeout_secs: 600,

@@ -2527,11 +2527,19 @@ pub async fn run_gateway_with_plugin_webhooks(
         .tls
         .as_ref()
         .is_some_and(|tls_cfg| tls_cfg.enabled);
-    let app = if tls_enabled {
-        app.layer(axum::middleware::from_fn(security_headers::apply_with_hsts))
-    } else {
-        app.layer(axum::middleware::from_fn(security_headers::apply))
-    };
+    // One policy per server: the dashboard CSP admits only the image origins
+    // the operator named, so chat markdown cannot render — and thereby beacon
+    // to — an arbitrary third-party host.
+    let csp: std::sync::Arc<str> = std::sync::Arc::from(security_headers::content_security_policy(
+        &config.gateway.csp_image_origins,
+    ));
+    let app = app.layer(axum::middleware::from_fn({
+        let csp = std::sync::Arc::clone(&csp);
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let csp = std::sync::Arc::clone(&csp);
+            async move { security_headers::apply_with_csp(request, next, csp, tls_enabled).await }
+        }
+    }));
 
     // ── TLS / mTLS setup ───────────────────────────────────────────
     let tls_acceptor = match &config.gateway.tls {
