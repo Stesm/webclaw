@@ -109,6 +109,18 @@ pub(crate) struct StreamInterruptedAfterOutput {
     pub(crate) message: String,
     pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
     pub(crate) cause: zeroclaw_providers::ReliableProviderTerminalFailure,
+    /// Whether the failed round may be continued instead of ending the turn.
+    /// True only for a provider-reported failure (an in-stream `error` event)
+    /// in a round that executed nothing on the provider's side: the delivered
+    /// text is kept, no tool ran, and re-asking is the recovery the provider
+    /// itself recommends.
+    pub(crate) continuable: bool,
+}
+
+impl StreamInterruptedAfterOutput {
+    pub(crate) fn continuable(&self) -> bool {
+        self.continuable
+    }
 }
 
 impl std::fmt::Display for StreamInterruptedAfterOutput {

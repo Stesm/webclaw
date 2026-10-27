@@ -1,5 +1,5 @@
 import type { SessionMessageRow, TurnProgress, WsAttachment } from '@/types/api';
-import { stripServerEnvelopes } from '@/lib/serverEnvelope';
+import { stripServerEnvelopes, isInternalTurnNudge } from '@/lib/serverEnvelope';
 
 const MAX_MESSAGES = 100;
 const PREFIX = 'zeroclaw_chat_history_v1:';
@@ -76,6 +76,10 @@ export function mapServerMessagesToPersisted(rows: SessionMessageRow[]): Persist
     const ts = new Date(base + idx * 1000).toISOString();
     idx += 1;
     if (row.role === 'user') {
+      // Runtime feedback that continues an interrupted answer is model
+      // context, not an operator turn: it stays in the agent's history so the
+      // model can resume, but it never becomes a bubble.
+      if (isInternalTurnNudge(row.content)) continue;
       // Persisted tool results arrive as a "[Tool results]" digest wrapping
       // <tool_result name="..."> blocks. Render each block as a tool card
       // instead of a raw user bubble.

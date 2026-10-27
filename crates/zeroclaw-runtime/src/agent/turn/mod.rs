@@ -202,6 +202,16 @@ pub(crate) fn retained_context_snapshot_with_memory(
 /// Maximum malformed internal tool-protocol retries before returning a safe fallback.
 pub(crate) const MAX_MALFORMED_TOOL_PROTOCOL_RETRIES: usize = 2;
 
+/// Model feedback appended after a provider stream died once the answer was
+/// already visible. It names the situation, keeps the model from repeating
+/// what the operator already read, and asks it to redo the interrupted step.
+pub(crate) const STREAM_CONTINUATION_FEEDBACK: &str = "[Provider interruption]\n\
+     Your previous message was cut off by a provider error before the tool call it \
+     was building completed. The text you had already sent is kept above as your \
+     message. Continue from exactly where you stopped. If you were about to call a \
+     tool, issue that tool call again with complete, valid JSON arguments. Do not \
+     repeat what you already wrote.";
+
 /// Resolve capacity + proactive-trim budget for one `(provider, model)` route.
 ///
 /// The turn engine's SINGLE authority for per-call limits. Daemon-backed agents
@@ -1813,6 +1823,14 @@ async fn run_tool_call_loop_impl<'a>(
     let mut accumulated_display_text = String::new();
     let mut single_tool_limitation_reported = false;
     let mut malformed_tool_protocol_retries: usize = 0;
+    // Provider-reported stream failures survived by continuing the answer
+    // instead of ending the turn. The budget is the operator's provider retry
+    // budget: a turn must not outlive the retry ladder a non-streaming call
+    // would have received. A configless turn has no operator policy, so it
+    // keeps the terminal behavior.
+    let mut stream_continuations: usize = 0;
+    let max_stream_continuations =
+        config.map_or(0, |config| config.reliability.provider_retries as usize);
     // Text withheld by the streaming text guard on a previous attempt,
     // stored with its trailing whitespace trimmed. A repeat that is
     // identical up to trailing whitespace means the model produced the same
@@ -2888,6 +2906,44 @@ async fn run_tool_call_loop_impl<'a>(
                 )
                 .await;
                 if recovered.recovered() {
+                    continue;
+                }
+                // A provider-reported stream failure that arrived after the
+                // caller saw text is recoverable: the failed round executed no
+                // tool at all, the delivered text stays, and re-asking is the
+                // recovery the provider itself recommends. Continue the answer
+                // on the operator's provider retry budget instead of ending a
+                // turn that had already started producing work.
+                if let Some(interrupted) = e.downcast_ref::<outcome::StreamInterruptedAfterOutput>()
+                    && !interrupted.partial_text.is_empty()
+                    && interrupted.continuable()
+                    && stream_continuations < max_stream_continuations
+                {
+                    stream_continuations += 1;
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Retry)
+                            .with_category(::zeroclaw_log::EventCategory::Provider)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(serde_json::json!({
+                                "channel": channel_name,
+                                "model_provider": active_model_provider_name,
+                                "model": active_model,
+                                "trace_id": turn_id,
+                                "retry": stream_continuations,
+                                "max_retries": max_stream_continuations,
+                                "partial_chars": interrupted.partial_text.chars().count(),
+                                "error": scrub_credentials(&interrupted.message),
+                            })),
+                        "llm_stream_continuation: provider stream failed after visible output, continuing the answer"
+                    );
+                    // The operator already read `partial_text`; it becomes the
+                    // model's own last message so the continuation resumes from
+                    // it rather than restarting the answer.
+                    accumulated_display_text.push_str(&interrupted.partial_text);
+                    accumulated_display_text.push_str("\n\n");
+                    turn_state.push_dual(ChatMessage::assistant(interrupted.partial_text.clone()));
+                    turn_state.push_dual(ChatMessage::user(STREAM_CONTINUATION_FEEDBACK));
                     continue;
                 }
                 // A stream that died after caller-visible output: persist the

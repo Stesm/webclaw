@@ -24,6 +24,23 @@ const RUNTIME_ENVELOPE_RE =
   /^\s*\[CURRENT DATE & TIME: \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[^\]]*\]\s*/;
 
 /**
+ * Feedback the runtime injects into the agent's history when a provider stream
+ * died after the answer text was already delivered. It is what tells the model
+ * to resume from its own last message; the operator never wrote it and it is
+ * not part of the conversation.
+ */
+const RUNTIME_INTERRUPTION_FEEDBACK_RE = /^\s*\[Provider interruption\]/;
+
+/**
+ * Whether a persisted user-role row is runtime feedback rather than an
+ * operator turn. Such a row stays in the agent's history (the model needs it to
+ * resume) but must never render as something the operator said.
+ */
+export function isInternalTurnNudge(content: string): boolean {
+  return RUNTIME_INTERRUPTION_FEEDBACK_RE.test(content);
+}
+
+/**
  * Drop the server-owned markers from a message before it is shown.
  *
  * Anchored to the start of the content, so a bracketed datetime appearing

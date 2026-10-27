@@ -5851,6 +5851,144 @@ mod tests {
         }
     }
 
+    /// Streams visible text, then the provider rejects the tool call the model
+    /// was building with an in-stream error — the shape polza.ai returns when
+    /// the upstream model emits a malformed native call. The next stream call
+    /// answers normally, so a turn that continues instead of dying recovers.
+    struct VisibleThenProviderFailureThenAnswerModelProvider {
+        stream_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for VisibleThenProviderFailureThenAnswerModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system should not be used in stream continuation tests")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            anyhow::bail!("non-streaming replay should not be used after visible output")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_providers::traits::StreamResult<StreamChunk>,
+        > {
+            let call = self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                Box::pin(futures_util::stream::iter(vec![
+                    Ok(StreamChunk::delta("visible")),
+                    Err(StreamError::ModelProvider(
+                        "Провайдер вернул некорректный вызов инструмента.".to_string(),
+                    )),
+                ]))
+            } else {
+                Box::pin(futures_util::stream::iter(vec![
+                    Ok(StreamChunk::delta("recovered")),
+                    Ok(StreamChunk::final_chunk()),
+                ]))
+            }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable
+        for VisibleThenProviderFailureThenAnswerModelProvider
+    {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "VisibleThenProviderFailureThenAnswerModelProvider"
+        }
+    }
+
+    /// Same visible text, but the stream dies on the transport (`Http`) rather
+    /// than on a provider-reported error. Transport drops keep the terminal
+    /// interruption: only the provider's own refusal of the request is worth
+    /// re-asking.
+    struct VisibleThenTransportFailureModelProvider;
+
+    #[async_trait]
+    impl ModelProvider for VisibleThenTransportFailureModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system should not be used in stream failure tests")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            anyhow::bail!("non-streaming replay should not be used after visible output")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_providers::traits::StreamResult<StreamChunk>,
+        > {
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamChunk::delta("visible")),
+                Err(StreamError::Http("connection reset".to_string())),
+            ]))
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for VisibleThenTransportFailureModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "VisibleThenTransportFailureModelProvider"
+        }
+    }
+
     enum NativeStreamTurn {
         ToolCall(ToolCall),
         Text(String),
@@ -12230,6 +12368,216 @@ mod tests {
         assert_eq!(new_messages_out[0].role, "assistant");
         assert_eq!(new_messages_out[0].content, expected_content);
         assert_eq!(chat_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// The provider rejects the tool call the model was building after the
+    /// answer text was already delivered. That failure must not end the turn:
+    /// the delivered text stays, the model is asked to continue, and the retry
+    /// budget is the operator's `provider_retries`.
+    #[tokio::test]
+    async fn run_tool_call_loop_continues_after_provider_stream_failure_within_retry_budget() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = VisibleThenProviderFailureThenAnswerModelProvider {
+            stream_calls: Arc::clone(&stream_calls),
+        };
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("stream an answer"),
+        ];
+        let mut new_messages_out = Vec::new();
+        let observer = NoopObserver;
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
+        let config = zeroclaw_config::schema::Config::default();
+        assert!(
+            config.reliability.provider_retries > 0,
+            "continuation is budgeted by the operator's provider retry budget"
+        );
+
+        let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    dispatch_model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: Some(&config),
+                max_tool_iterations: 4,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+                security: None,
+            },
+            history: &mut history,
+            channel_name: "matrix",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: Some(event_tx),
+            served_route_sink: None,
+            steering: None,
+            new_messages_out: Some(&mut new_messages_out),
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
+        })
+        .await
+        .expect("a provider-reported stream failure after visible output must continue the turn");
+
+        assert_eq!(result, "visible\n\nrecovered");
+        assert_eq!(
+            stream_calls.load(Ordering::SeqCst),
+            2,
+            "the interrupted round is re-asked exactly once"
+        );
+
+        let chat: Vec<(&str, &str)> = history
+            .iter()
+            .filter(|message| message.role != "system")
+            .map(|message| (message.role.as_str(), message.content.as_str()))
+            .collect();
+        assert_eq!(
+            chat,
+            vec![
+                ("user", "stream an answer"),
+                // What the operator already read becomes the model's own last
+                // message, so the continuation resumes instead of restarting.
+                ("assistant", "visible"),
+                ("user", crate::agent::turn::STREAM_CONTINUATION_FEEDBACK),
+                ("assistant", "recovered"),
+            ]
+        );
+
+        let mut deltas = Vec::new();
+        while let Some(event) = event_rx.recv().await {
+            if let zeroclaw_api::agent::TurnEvent::Chunk { delta } = event {
+                deltas.push(delta);
+            }
+        }
+        assert_eq!(
+            deltas,
+            vec!["visible".to_string(), "recovered".to_string()],
+            "the delivered text is never replayed"
+        );
+    }
+
+    /// A transport failure after visible output keeps today's terminal
+    /// behavior even with a retry budget configured: only the provider's own
+    /// in-stream refusal is worth re-asking.
+    #[tokio::test]
+    async fn run_tool_call_loop_keeps_transport_interruption_terminal() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let model_provider = VisibleThenTransportFailureModelProvider;
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("stream an answer"),
+        ];
+        let mut new_messages_out = Vec::new();
+        let observer = NoopObserver;
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
+        let config = zeroclaw_config::schema::Config::default();
+        let interrupted_marker = crate::i18n::get_required_cli_string("turn-stream-interrupted");
+
+        let error = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    dispatch_model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: Some(&config),
+                max_tool_iterations: 4,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+                security: None,
+            },
+            history: &mut history,
+            channel_name: "matrix",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: Some(event_tx),
+            served_route_sink: None,
+            steering: None,
+            new_messages_out: Some(&mut new_messages_out),
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
+        })
+        .await
+        .expect_err("a transport failure after visible output stays terminal");
+
+        let interrupted = error
+            .downcast_ref::<crate::agent::turn::outcome::StreamInterruptedAfterOutput>()
+            .expect("transport failure after visible text keeps the interruption error");
+        assert!(
+            !interrupted.continuable(),
+            "transport drops are not re-asked"
+        );
+        assert_eq!(interrupted.partial_text, "visible");
+        assert_eq!(
+            history.last().map(|message| message.content.clone()),
+            Some(format!("visible\n\n{interrupted_marker}")),
+            "the delivered text is committed with the interruption marker"
+        );
+        while event_rx.recv().await.is_some() {}
     }
 
     #[tokio::test]

@@ -151,10 +151,14 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
         String,
         std::collections::VecDeque<String>,
     > = std::collections::HashMap::new();
-    // Tracks event_tx-visible output only (Chunk/Thinking/pre-executed tool
+    // Tracks event_tx-visible ANSWER output only (Chunk and pre-executed tool
     // events). Draft (`on_delta`) forwards don't count: drafts are mutable
     // surfaces, so a non-streaming retry after a stream error overwrites
-    // rather than duplicates.
+    // rather than duplicates. Reasoning progress (`TurnEvent::Thinking`) is
+    // visible in the client but is not part of the answer: it is transient
+    // narration that the retried request regenerates, so treating it as
+    // committed output would forfeit the recovery of a turn whose answer never
+    // started.
     let mut visible_event_output = false;
     let mut replay_blocking_activity = false;
     let mut forwarded_text = String::new();
@@ -261,6 +265,17 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
                     {
                         usage = refusal.usage.as_deref().cloned();
                     }
+                    // A provider-reported stream failure (an in-stream `error`
+                    // event) is worth continuing: the delivered text stays, the
+                    // failed round executed no tool at all, and the provider
+                    // itself advises retrying the request. A transport drop or a
+                    // refusal is not that — those keep their existing terminal
+                    // handling.
+                    let continuable = !outcome.saw_pre_executed_tool_activity
+                        && matches!(
+                            err,
+                            zeroclaw_api::model_provider::StreamError::ModelProvider(_)
+                        );
                     let cause = zeroclaw_providers::ReliableProviderTerminalFailure::from_error(
                         &provider_error,
                     )
@@ -270,6 +285,7 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
                         message,
                         usage,
                         cause,
+                        continuable,
                     }
                     .into());
                 }
@@ -308,7 +324,6 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
                     let _ = tx.send(StreamDelta::Reasoning(delta.clone())).await;
                 }
                 if let Some(tx) = event_tx {
-                    visible_event_output = true;
                     let _ = tx.send(TurnEvent::Thinking { delta }).await;
                 }
             }
@@ -377,9 +392,10 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
                         let _ = tx.send(StreamDelta::Reasoning(reasoning.to_string())).await;
                     }
                     // Thinking is surfaced as its own TurnEvent variant; it
-                    // must never reach the Chunk/draft text surfaces.
+                    // must never reach the Chunk/draft text surfaces, and it
+                    // never counts as committed answer output — see
+                    // `visible_event_output`.
                     if let Some(tx) = event_tx {
-                        visible_event_output = true;
                         let _ = tx
                             .send(TurnEvent::Thinking {
                                 delta: reasoning.to_string(),
@@ -1509,6 +1525,249 @@ mod tests {
             err.to_string().contains("provider exploded"),
             "the underlying provider error must be surfaced: {err}"
         );
+    }
+
+    /// Provider that streams reasoning progress (`Thinking`) and then fails,
+    /// without ever producing answer text. Thinking is visible in the client,
+    /// but it is not committed output: the retried request regenerates it, so
+    /// the failure must keep the non-streaming fallback eligible instead of
+    /// ending the turn as an interruption.
+    struct ThinkingOnlyThenErrorProvider;
+
+    impl ::zeroclaw_api::attribution::Attributable for ThinkingOnlyThenErrorProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "ThinkingOnlyThenErrorProvider"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ThinkingOnlyThenErrorProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: true,
+                vision: false,
+                prompt_caching: false,
+                extended_thinking: false,
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            let events: Vec<StreamResult<StreamEvent>> = vec![
+                Ok(StreamEvent::ThinkingDelta("думаю над вызовом".into())),
+                Err(::zeroclaw_api::model_provider::StreamError::ModelProvider(
+                    "Провайдер вернул некорректный вызов инструмента.".into(),
+                )),
+            ];
+            Box::pin(futures_util::stream::iter(events))
+        }
+    }
+
+    /// Reasoning progress is shown to the operator but must not be treated as
+    /// committed answer output: a failure after only-thinking has to stay a
+    /// plain pre-output error, so the runtime still falls back to (and retries)
+    /// a non-streaming call.
+    #[tokio::test]
+    async fn thinking_only_progress_does_not_disable_fallback_on_provider_error() {
+        let provider = ThinkingOnlyThenErrorProvider;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        let result = consume_provider_streaming_response(
+            &provider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,      // on_delta (draft sink)
+            Some(&tx), // event_tx
+            false,
+            StreamReasoningMode::Full,
+            None,
+        )
+        .await;
+
+        drop(tx);
+        let mut thinking = Vec::new();
+        let mut chunks = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                crate::agent::TurnEvent::Thinking { delta } => thinking.push(delta),
+                crate::agent::TurnEvent::Chunk { delta } => chunks.push(delta),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            thinking,
+            vec!["думаю над вызовом".to_string()],
+            "reasoning progress stays visible to the operator"
+        );
+        assert!(
+            chunks.is_empty(),
+            "reasoning must never reach the answer text surface: {chunks:?}"
+        );
+
+        let err = result.expect_err("provider error must surface");
+        assert!(
+            err.downcast_ref::<crate::agent::turn::outcome::StreamInterruptedAfterOutput>()
+                .is_none(),
+            "a thinking-only stream that dies must stay eligible for the non-streaming \
+             fallback; got StreamInterruptedAfterOutput instead"
+        );
+        assert!(
+            err.to_string().contains("некорректный вызов инструмента"),
+            "the underlying provider error must be surfaced: {err}"
+        );
+    }
+
+    /// Provider that delivers answer text, then reports an in-stream failure —
+    /// optionally after declaring a tool it already executed on its own side.
+    struct VisibleThenFailureProvider {
+        pre_executed_tool: bool,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for VisibleThenFailureProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "VisibleThenFailureProvider"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for VisibleThenFailureProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            let mut events: Vec<StreamResult<StreamEvent>> = Vec::new();
+            if self.pre_executed_tool {
+                events.push(Ok(StreamEvent::PreExecutedToolCall {
+                    name: "browser".into(),
+                    args: "{}".into(),
+                }));
+            }
+            events.push(Ok(StreamEvent::TextDelta(StreamChunk::delta("visible"))));
+            events.push(Err(
+                ::zeroclaw_api::model_provider::StreamError::ModelProvider(
+                    "Провайдер вернул некорректный вызов инструмента.".into(),
+                ),
+            ));
+            Box::pin(futures_util::stream::iter(events))
+        }
+    }
+
+    /// Only a provider-reported failure in a round that executed nothing on the
+    /// provider's side may be continued. A round that already ran a provider
+    /// tool keeps the terminal interruption, because continuing could replay
+    /// the effects of that call.
+    #[tokio::test]
+    async fn interruption_is_continuable_only_without_provider_executed_tools() {
+        for (pre_executed_tool, expected) in [(false, true), (true, false)] {
+            let provider = VisibleThenFailureProvider { pre_executed_tool };
+            let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+
+            let result = consume_provider_streaming_response(
+                &provider,
+                &[ChatMessage::user("go")],
+                None,
+                "mock-model",
+                Some(0.0),
+                None,
+                None,
+                Some(&tx),
+                false,
+                StreamReasoningMode::Status,
+                None,
+            )
+            .await;
+
+            let err = result.expect_err("stream must fail after visible text");
+            let interrupted = err
+                .downcast_ref::<StreamInterruptedAfterOutput>()
+                .expect("visible output plus provider error must interrupt");
+            assert_eq!(
+                interrupted.continuable(),
+                expected,
+                "pre_executed_tool={pre_executed_tool}"
+            );
+            drop(rx.recv().await);
+        }
     }
 
     #[tokio::test]

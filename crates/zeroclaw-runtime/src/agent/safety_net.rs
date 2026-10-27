@@ -1592,7 +1592,7 @@ impl ModelProvider for StreamThenHangProvider {
         Ok("ok".into())
     }
     async fn chat(&self, _: ChatRequest<'_>, _: &str, _: Option<f64>) -> Result<ChatResponse> {
-        Ok(text_response("non-streamed fallback (must not be reached)"))
+        Ok(text_response("non-streamed fallback answer"))
     }
     fn supports_streaming(&self) -> bool {
         true
@@ -1710,7 +1710,8 @@ async fn safety_net_cancel_after_streamed_output_persists_partial() {
 async fn safety_net_stream_error_persists_only_forwarded_text() {
     let provider = StreamThenHangProvider {
         events: parking_lot::Mutex::new(vec![
-            // Thinking marks event-visible output without any forwarded text.
+            // Thinking is visible in the client but is not committed answer
+            // output, so it must not forfeit the non-streaming fallback.
             Ok(zeroclaw_api::model_provider::StreamEvent::TextDelta(
                 zeroclaw_api::model_provider::StreamChunk {
                     delta: String::new(),
@@ -1735,22 +1736,25 @@ async fn safety_net_stream_error_persists_only_forwarded_text() {
             .await
     });
     while rx.recv().await.is_some() {}
-    let err = handle
-        .await
-        .expect("task join")
-        .expect_err("stream error after visible output must fail the turn (no fallback retry)");
+    let outcome = handle.await.expect("task join").expect(
+        "a stream that died after reasoning progress but before any answer text must still \
+         recover through the non-streaming fallback",
+    );
 
     assert_eq!(
-        err.committed_response,
-        crate::i18n::get_english_cli_string_with_args("turn-stream-interrupted", &[]),
-        "nothing was forwarded, so nothing may be committed as delivered"
+        outcome.response, "non-streamed fallback answer",
+        "the recovered answer is what the operator receives"
     );
     assert!(
-        !err.new_messages.iter().any(|m| matches!(
+        !outcome.new_messages.iter().any(|m| matches!(
             m,
             ConversationMessage::Chat(c) if c.content.contains("tool_call")
         )),
         "guard-withheld text the consumer never saw must not persist as delivered output"
+    );
+    assert!(
+        !outcome.response.contains("tool_call"),
+        "withheld protocol text must not leak through the committed answer"
     );
 }
 

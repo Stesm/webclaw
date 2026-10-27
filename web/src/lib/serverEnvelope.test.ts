@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { stripServerEnvelopes } from './serverEnvelope.ts';
+import { isInternalTurnNudge, stripServerEnvelopes } from './serverEnvelope.ts';
 
 /**
  * The server-owned markers that must not reach the operator's eyes: the
@@ -41,4 +41,26 @@ test('a datetime inside the message survives', () => {
 
 test('plain content is untouched', () => {
   assert.equal(stripServerEnvelopes('обычное сообщение'), 'обычное сообщение');
+});
+
+/**
+ * The runtime appends model feedback when a provider stream dies after the
+ * answer text was already delivered, so the model resumes from its own last
+ * message. It lives in the agent's history as a user-role row, but the
+ * operator never wrote it and it must not render as their turn.
+ */
+test('runtime interruption feedback is recognized as internal', () => {
+  assert.equal(
+    isInternalTurnNudge(
+      '[Provider interruption]\nYour previous message was cut off by a provider error.',
+    ),
+    true,
+  );
+  assert.equal(isInternalTurnNudge('  [Provider interruption] continue'), true);
+});
+
+test('operator text that merely mentions an interruption is not internal', () => {
+  assert.equal(isInternalTurnNudge('Провайдер прервал ответ, продолжи'), false);
+  assert.equal(isInternalTurnNudge('[URGENT] provider interruption'), false);
+  assert.equal(isInternalTurnNudge(''), false);
 });
