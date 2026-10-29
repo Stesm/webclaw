@@ -1631,7 +1631,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.followup_placeholder': 'Add to the running turn…',
     'agent.send_followup': 'Add to the running turn',
     'agent.followup_pending': 'Into the running turn…',
-    'agent.followup_lost': 'Not sent — the turn ended first. Send it again.',
+    'agent.followup_lost': 'Not delivered — send it again.',
     'agent.followup_wait': 'Finish the running turn before using a command.',
     // Supervised-mode tool approval (#6522)
     'agent.approval_title': 'Tool approval required',
