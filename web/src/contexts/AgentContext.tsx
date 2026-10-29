@@ -74,11 +74,24 @@ export interface ChatMessage {
   ephemeral?: boolean;
   /** User-visible lifecycle notice, rendered distinctly from agent output. */
   notice?: boolean;
+  /**
+   * Set on a message the operator sent into a turn that was already running
+   * (a follow-up). `pending` until the gateway acknowledges it, `accepted` once
+   * the running turn queued it, `lost` when the turn reached a terminal state
+   * first — the runtime never folded it in, so it has to be sent again.
+   */
+  followUp?: 'pending' | 'accepted' | 'lost';
 }
 
 export interface AgentContextValue {
   messages: ChatMessage[];
   sendMessage: (content: string) => void;
+  /**
+   * Add a message to the turn that is already running instead of starting a
+   * new one. The gateway folds it in as its own user turn before the next model
+   * round; if the turn ends first, the bubble is marked `lost`.
+   */
+  sendFollowUp: (content: string) => void;
   connected: boolean;
   error: string | null;
   typing: boolean;
@@ -303,6 +316,11 @@ export function AgentProvider({
   // Attachments delivered during the in-flight turn, collected from
   // `tool_result` frames and attached to the turn's committed agent message.
   const pendingAttachmentsRef = useRef<WsAttachment[]>([]);
+  // Ids of follow-up bubbles whose `steer_accepted` has not arrived yet. The
+  // gateway answers on the same socket in the order it received them, so the
+  // head of this list is the bubble the next acknowledgement or refusal
+  // settles.
+  const followUpQueueRef = useRef<string[]>([]);
   // Rebuild callbacks intentionally retain the dependency shape already on
   // master. These mirrors still make their async work use the latest session
   // and injected runtime after a conversation switch.
@@ -447,6 +465,43 @@ export function AgentProvider({
     }
   }, []);
 
+  /**
+   * Mark every follow-up bubble still awaiting a `steer_accepted` as lost.
+   *
+   * Called when the turn reaches a terminal frame first: the turn ended while a
+   * message sat in its queue. The bubble stays in the transcript with its "not
+   * sent" caption so the operator can resend it instead of believing the model
+   * saw it.
+   */
+  const markPendingFollowUpsLost = useCallback(() => {
+    if (followUpQueueRef.current.length === 0) return;
+    const lost = new Set(followUpQueueRef.current.splice(0));
+    localMessageMutationVersionRef.current += 1;
+    setMessages((prev) =>
+      prev.map((message) =>
+        lost.has(message.id) ? { ...message, followUp: 'lost' as const } : message,
+      ),
+    );
+  }, []);
+
+  /**
+   * Mark the oldest unacknowledged follow-up as lost.
+   *
+   * Used for a refusal that belongs to one message (the steering queue was full
+   * or the turn had stopped accepting): later messages may still be accepted,
+   * so only the head of the queue is settled.
+   */
+  const markOldestFollowUpLost = useCallback(() => {
+    const id = followUpQueueRef.current.shift();
+    if (!id) return;
+    localMessageMutationVersionRef.current += 1;
+    setMessages((prev) =>
+      prev.map((message) =>
+        message.id === id ? { ...message, followUp: 'lost' as const } : message,
+      ),
+    );
+  }, []);
+
   // Centralised WebSocket message handler — reused across initial connect and reconnects.
   const handleWsMessage = useCallback((msg: WsMessage) => {
     switch (msg.type) {
@@ -483,6 +538,20 @@ export function AgentProvider({
       case 'connected':
         break;
 
+      case 'steer_accepted': {
+        // The running turn queued this follow-up. Acknowledgements arrive in
+        // the order the messages were sent, so this settles the oldest bubble
+        // still waiting for one.
+        const id = followUpQueueRef.current.shift();
+        if (!id) break;
+        setMessages((prev) =>
+          prev.map((message) =>
+            message.id === id ? { ...message, followUp: 'accepted' as const } : message,
+          ),
+        );
+        break;
+      }
+
       case 'thinking': {
         setTyping(true);
         const { state } = foldTurnStream({ type: 'thinking', content: msg.content });
@@ -507,6 +576,9 @@ export function AgentProvider({
 
       case 'message':
       case 'done': {
+        // The turn is over: a follow-up that never got its acknowledgement was
+        // not folded into it.
+        markPendingFollowUpsLost();
         const { completion: outcome } = foldTurnStream({
           type: msg.type,
           full_response: msg.full_response,
@@ -763,6 +835,7 @@ export function AgentProvider({
         // Gateway sends this after a cancelled turn; the parked approval (if
         // any) is no longer valid because its request_id belongs to the old
         // turn. Clear so the banner does not linger across the abort.
+        markPendingFollowUpsLost();
         foldTurnStream({ type: 'aborted' });
         setStreamingContent('');
         setStreamingThinking('');
@@ -780,6 +853,7 @@ export function AgentProvider({
         if (msg.session_id !== activeSessionIdRef.current) {
           break;
         }
+        markPendingFollowUpsLost();
         if (backgroundTurnRef.current) {
           // This pane was only watching a background turn. Leave viewer state
           // and force-pull the persisted reply, bypassing the typing guard that
@@ -801,14 +875,25 @@ export function AgentProvider({
       }
 
       case 'turn_in_progress':
-        // Sent when we tried to run a turn another connection already owns.
-        // Watch instead of queueing behind it.
+        // Sent when this socket tried to run a turn another connection already
+        // owns and could not add its message to it (a different principal owns
+        // the running turn, or it stopped accepting steering). Watch instead
+        // of queueing behind it.
+        markOldestFollowUpLost();
         backgroundTurnRef.current = true;
         setBackgroundTurn(true);
         setTyping(true);
         break;
 
       case 'error':
+        if (msg.code === 'STEERING_QUEUE_FULL' || msg.code === 'STEERING_CLOSED') {
+          // A refused follow-up must not tear down the turn it failed to join:
+          // the stream, the tool cards and `typing` all belong to that running
+          // turn, so only the message itself is settled as not delivered.
+          markOldestFollowUpLost();
+          break;
+        }
+        markPendingFollowUpsLost();
         const friendlyMessage = friendlyAgentError(msg.message);
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => [
@@ -835,7 +920,7 @@ export function AgentProvider({
         setLiveProgress(null);
         break;
     }
-  }, [foldTurnStream, refreshTranscript]);
+  }, [foldTurnStream, markOldestFollowUpLost, markPendingFollowUpsLost, refreshTranscript]);
 
   // Wire up a WebSocketClient instance with version-guarded callbacks.
   const attachSocketCallbacks = useCallback((ws: SessionSocket) => {
@@ -1073,6 +1158,39 @@ export function AgentProvider({
       setError(t('agent.send_error'));
     }
   }, [foldTurnStream]);
+
+  /**
+   * Send a message into the turn that is already running.
+   *
+   * The frame is the same `message` the composer sends, but nothing about the
+   * live turn is reset: its streamed text, thinking, tool cards and `typing`
+   * state belong to that turn and it is what the message joins. The gateway
+   * acknowledges with `steer_accepted`; a refusal or a terminal frame marks the
+   * bubble `lost` so the operator can resend instead of assuming it landed.
+   */
+  const sendFollowUp = useCallback((content: string) => {
+    if (!wsRef.current?.connected) return;
+    try {
+      wsRef.current.sendMessage(content);
+    } catch {
+      setError(t('agent.send_error'));
+      return;
+    }
+    const id = generateUUID();
+    followUpQueueRef.current.push(id);
+    localMessageMutationVersionRef.current += 1;
+    setMessages((prev) => [
+      ...prev,
+      {
+        id,
+        role: 'user',
+        content,
+        timestamp: new Date(),
+        local: true,
+        followUp: 'pending',
+      },
+    ]);
+  }, []);
 
   const switchModel = useCallback(async (model: string) => {
     if (modelLoading) return; // debounce
@@ -1412,6 +1530,7 @@ export function AgentProvider({
   const value: AgentContextValue = {
     messages,
     sendMessage,
+    sendFollowUp,
     connected,
     error,
     typing,

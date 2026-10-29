@@ -1627,6 +1627,12 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.tool_activity_show': 'Show tool activity',
     'agent.tool_activity_hide': 'Hide tool activity',
     'agent.running': 'Running…',
+    // Follow-ups into a turn that is already streaming
+    'agent.followup_placeholder': 'Add to the running turn…',
+    'agent.send_followup': 'Add to the running turn',
+    'agent.followup_pending': 'Into the running turn…',
+    'agent.followup_lost': 'Not sent — the turn ended first. Send it again.',
+    'agent.followup_wait': 'Finish the running turn before using a command.',
     // Supervised-mode tool approval (#6522)
     'agent.approval_title': 'Tool approval required',
     'agent.approval_tool': 'Tool',

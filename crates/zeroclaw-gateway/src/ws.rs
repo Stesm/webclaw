@@ -861,49 +861,69 @@ async fn handle_socket(
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
             if parsed["type"].as_str() == Some("message") {
                 if let Some(content) = first_chat_message_content(text) {
-                    let turn_lease = match state
-                        .reserve_agent_turn_at(agent_alias.clone(), turn_generation)
+                    // A running turn takes this message first: the first frame
+                    // on a fresh socket can arrive while another connection
+                    // still owns the session's turn (a reload racing the
+                    // detached turn), and it must join that turn rather than
+                    // wait behind it on the session permit.
+                    if !steer_running_turn(
+                        &state,
+                        &mut sender,
+                        &session_key,
+                        &session_id,
+                        auth_subject.as_deref(),
+                        &content,
+                    )
+                    .await
                     {
-                        Ok(lease) => Some(lease),
-                        Err(error) => {
-                            if refuse_unadmitted_turn(&mut sender, &mut receiver, &error).await {
-                                return;
-                            }
-                            // Refused, but the socket stays for a retry.
-                            None
-                        }
-                    };
-                    if let Some(_turn_lease) = turn_lease {
-                        let _session_guard = match state.session_queue.acquire(&session_key).await {
-                            Ok(guard) => guard,
-                            Err(e) => {
-                                let err = serde_json::json!({
-                                    "type": "error",
-                                    "message": e.to_string(),
-                                    "code": session_queue_ws_error_code(&e)
-                                });
-                                let _ = sender.send(Message::Text(err.to_string().into())).await;
-                                return;
+                        let turn_lease = match state
+                            .reserve_agent_turn_at(agent_alias.clone(), turn_generation)
+                        {
+                            Ok(lease) => Some(lease),
+                            Err(error) => {
+                                if refuse_unadmitted_turn(&mut sender, &mut receiver, &error).await
+                                {
+                                    return;
+                                }
+                                // Refused, but the socket stays for a retry.
+                                None
                             }
                         };
-                        let client_gone = process_chat_message(
-                            &state,
-                            &mut agent,
-                            &mut sender,
-                            &mut receiver,
-                            &mut approval_event_rx,
-                            &pending_approvals,
-                            &mut ping_interval,
-                            &ws_memory,
-                            &mut persisted_watermark,
-                            &content,
-                            &session_key,
-                            &session_id,
-                            auth_subject.as_deref(),
-                        )
-                        .await;
-                        if client_gone {
-                            return;
+                        if let Some(_turn_lease) = turn_lease {
+                            let _session_guard =
+                                match state.session_queue.acquire(&session_key).await {
+                                    Ok(guard) => guard,
+                                    Err(e) => {
+                                        let err = serde_json::json!({
+                                            "type": "error",
+                                            "message": e.to_string(),
+                                            "code": session_queue_ws_error_code(&e)
+                                        });
+                                        let _ = sender
+                                            .send(Message::Text(err.to_string().into()))
+                                            .await;
+                                        return;
+                                    }
+                                };
+                            let client_gone = process_chat_message(
+                                &state,
+                                &mut agent,
+                                &mut sender,
+                                &mut receiver,
+                                &mut approval_event_rx,
+                                &pending_approvals,
+                                &mut ping_interval,
+                                &ws_memory,
+                                &mut persisted_watermark,
+                                &content,
+                                &session_key,
+                                &session_id,
+                                auth_subject.as_deref(),
+                            )
+                            .await;
+                            if client_gone {
+                                return;
+                            }
                         }
                     }
                 }
@@ -1054,6 +1074,27 @@ async fn handle_socket(
                     continue;
                 }
 
+                // A turn is already running for this session: this socket's own
+                // (the composer stays live while it streams) or another
+                // connection's (a reloaded tab, a second pane). Add the message
+                // to that turn instead of refusing it or queueing behind it: the
+                // runtime folds it in as its own user turn before the next model
+                // round, so it reaches the model in this same turn. Only when the
+                // running turn has already stopped accepting steering do we fall
+                // through and start the next turn with this message.
+                if steer_running_turn(
+                    &state,
+                    &mut sender,
+                    &session_key,
+                    &session_id,
+                    auth_subject.as_deref(),
+                    &content,
+                )
+                .await
+                {
+                    continue;
+                }
+
                 let _turn_lease = match state
                     .reserve_agent_turn_at(agent_alias.clone(), turn_generation)
                 {
@@ -1065,15 +1106,6 @@ async fn handle_socket(
                         continue;
                     }
                 };
-
-                // Another connection owns an in-flight turn for this session.
-                // Do not queue behind it (a long provider retry can outlast the
-                // session-lock timeout): stay a viewer until `turn_done`.
-                if session_turn_in_progress(&state, &session_key) {
-                    let err = turn_in_progress_ws_frame(&session_id);
-                    let _ = sender.send(Message::Text(err.to_string().into())).await;
-                    continue;
-                }
 
                 // Acquire session lock to serialize concurrent turns
                 let _session_guard = match state.session_queue.acquire(&session_key).await {
@@ -1492,6 +1524,72 @@ fn session_turn_progress(
         .expect("active_turns lock poisoned")
         .get(session_key)
         .map(|turn| turn.progress())
+}
+
+/// Clone the live-turn handle so a socket that did not start the turn can still
+/// add a steering message to it.
+fn active_turn_for(
+    state: &AppState,
+    session_key: &str,
+) -> Option<Arc<crate::live_turn::ActiveTurn>> {
+    state
+        .active_turns
+        .lock()
+        .expect("active_turns lock poisoned")
+        .get(session_key)
+        .cloned()
+}
+
+/// Acknowledge a steering message the running turn accepted.
+async fn send_steer_accepted(sender: &mut futures_util::stream::SplitSink<WebSocket, Message>) {
+    let ack = serde_json::json!({ "type": "steer_accepted" });
+    let _ = sender.send(Message::Text(ack.to_string().into())).await;
+}
+
+/// Add `content` to the turn currently running for the session.
+///
+/// Returns `true` when the frame is fully handled: the running turn queued the
+/// message (acknowledged) or refused it in a way this socket must hear about
+/// (a full queue, another principal's turn). Returns `false` when no turn is
+/// running any more, so the caller starts the next turn with this message.
+///
+/// The liveness signal is the live-turn entry itself: it is inserted before the
+/// turn starts and removed only after its transcript is persisted, and the
+/// steering channel is installed before the entry becomes visible.
+async fn steer_running_turn(
+    state: &AppState,
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    session_key: &str,
+    session_id: &str,
+    auth_subject: Option<&str>,
+    content: &str,
+) -> bool {
+    let Some(turn) = active_turn_for(state, session_key) else {
+        return false;
+    };
+    match turn.steer(auth_subject, gateway_steering_input(content.to_string())) {
+        Ok(()) => {
+            send_steer_accepted(sender).await;
+            true
+        }
+        Err(crate::live_turn::SteerRefusal::Full) => {
+            let err = serde_json::json!({
+                "type": "error",
+                "message": "Steering queue is full for the running turn",
+                "code": "STEERING_QUEUE_FULL"
+            });
+            let _ = sender.send(Message::Text(err.to_string().into())).await;
+            true
+        }
+        Err(crate::live_turn::SteerRefusal::NotOwner) => {
+            // Another principal owns the running turn: this socket may watch
+            // it, not steer it.
+            let err = turn_in_progress_ws_frame(session_id);
+            let _ = sender.send(Message::Text(err.to_string().into())).await;
+            true
+        }
+        Err(crate::live_turn::SteerRefusal::Closed) => false,
+    }
 }
 
 fn turn_in_progress_ws_frame(session_id: &str) -> serde_json::Value {
@@ -2137,16 +2235,25 @@ async fn process_chat_message(
     );
 
     // ── Live-turn progress mirror ────────────────────────────────
-    // Register an in-process mirror holding the turn's cancel handle and a
-    // compact progress snapshot. A (re)connecting viewer reads it through
-    // `GET /api/sessions/{id}/messages` and the `session_start` frame, and
-    // `session_turn_in_progress` uses it to refuse a second concurrent turn.
-    // `CancellationToken` clones share cancellation state, so cancelling
-    // through the registry above also cancels this mirror's token.
-    let active_turn = Arc::new(crate::live_turn::ActiveTurn::new(
-        turn_id.clone(),
-        cancel_token.as_ref().clone(),
-    ));
+    // Register an in-process mirror holding the turn's cancel handle, the
+    // steering channel, and a compact progress snapshot. A (re)connecting
+    // viewer reads the snapshot through `GET /api/sessions/{id}/messages` and
+    // the `session_start` frame, steers the turn through the channel when its
+    // own message arrives, and `session_turn_in_progress` uses the entry to
+    // recognize a second concurrent turn. `CancellationToken` clones share
+    // cancellation state, so cancelling through the registry above also cancels
+    // this mirror's token.
+    //
+    // The steering channel is installed before the entry becomes visible: a
+    // viewer that sees the turn as live must also find a channel to steer it,
+    // never a turn that reports `Closed` because it was registered first.
+    let (steering_tx, mut steering_rx) =
+        tokio::sync::mpsc::channel::<zeroclaw_runtime::agent::SteeringInput>(32);
+    let active_turn = Arc::new(
+        crate::live_turn::ActiveTurn::new(turn_id.clone(), cancel_token.as_ref().clone())
+            .with_owner(auth_subject.map(str::to_string)),
+    );
+    active_turn.set_steering(steering_tx.clone());
     {
         state
             .active_turns
@@ -2157,8 +2264,6 @@ async fn process_chat_message(
 
     // Channel for streaming turn events from the agent.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
-    let (steering_tx, mut steering_rx) =
-        tokio::sync::mpsc::channel::<zeroclaw_runtime::agent::SteeringInput>(32);
 
     let content_owned = content.to_string();
     let session_key_owned = session_key.to_string();
@@ -2325,7 +2430,9 @@ async fn process_chat_message(
                                             continue;
                                         }
                                         match steering_tx.try_send(gateway_steering_input(content)) {
-                                            Ok(()) => {}
+                                            Ok(()) => {
+                                                send_steer_accepted(&mut *sender).await;
+                                            }
                                             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                                                 let err = serde_json::json!({
                                                     "type": "error",
@@ -3960,10 +4067,10 @@ data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text
     }
 
     #[test]
-    fn reconnect_during_detached_turn_refreshes_history_before_the_follow_up() {
+    fn reconnect_during_detached_turn_steers_into_the_running_turn() {
         run_ws_regression(
-            "ws-detach-reconnect-history",
-            reconnect_during_detached_turn_refreshes_history_before_the_follow_up_inner,
+            "ws-detach-reconnect-steer",
+            reconnect_during_detached_turn_steers_into_the_running_turn_inner,
         );
     }
 
@@ -4113,13 +4220,13 @@ data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text
         fixture.shutdown();
     }
 
-    async fn reconnect_during_detached_turn_refreshes_history_before_the_follow_up_inner() {
-        // A socket that reconnects while the detached turn is still running
-        // seeds its agent from the transcript as persisted at that moment. Its
-        // follow-up waits for that turn on the session permit and must then
-        // run on the transcript the turn persisted, not on the stale snapshot.
+    async fn reconnect_during_detached_turn_steers_into_the_running_turn_inner() {
+        // A socket that reconnects while the detached turn is still running is
+        // a viewer of that turn, not the owner of the next one. Its message is
+        // folded into the running turn as its own user round — the operator's
+        // "close the tab, remember something, come back and add it" path.
         let mut fixture = ParkedTurnFixture::spawn().await;
-        let session_id = "detach-reconnect";
+        let session_id = "detach-steer";
         let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
         let first_prompt = "start the long task";
         let follow_up = "now continue from where that left off";
@@ -4141,17 +4248,21 @@ data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text
         let (mut second, session_start) = fixture.connect(session_id).await;
         assert_eq!(session_start["resumed"], true);
         assert_eq!(session_start["message_count"], 1);
-        let snapshot = fixture.backend.load(&session_key);
-        assert!(
-            snapshot
-                .iter()
-                .any(|message| message.role == "user" && message.content == first_prompt),
-            "the reconnected socket sees the operator's message: {snapshot:?}"
+        assert_eq!(
+            session_start["running"], true,
+            "the reconnected socket watches the running turn: {session_start}"
         );
 
-        // The follow-up queues behind the running turn on the session permit;
-        // it must not start a concurrent turn.
+        // The message joins the running turn instead of starting a second one.
         send_chat(&mut second, follow_up).await;
+        loop {
+            let frame = next_text_frame(&mut second).await;
+            match frame["type"].as_str() {
+                Some("steer_accepted") => break,
+                Some("error") => panic!("the follow-up was refused: {frame}"),
+                _ => {}
+            }
+        }
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
             fixture.has_live_turn(&session_key),
@@ -4159,41 +4270,33 @@ data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text
         );
         assert!(
             fixture.request_seen.try_recv().is_err(),
-            "the follow-up waits for the permit instead of reaching the provider"
+            "the follow-up reaches no provider until the running turn reaches its next round"
         );
 
-        // Let the first turn finish. The queued follow-up then runs, and its
-        // provider request must include what the first turn persisted.
+        // Let the first round finish. The steered message opens the same
+        // turn's next round, and that provider request must carry it after the
+        // answer the operator already watched arrive.
         fixture.release_next();
         let second_request = fixture.next_provider_request().await;
         let messages = provider_messages(&second_request);
         let tail: Vec<(&str, &str)> = messages
             .iter()
             .rev()
-            .take(3)
+            .take(2)
             .rev()
             .map(|(role, text)| (role.as_str(), text.as_str()))
             .collect();
         assert!(
             matches!(
                 tail.as_slice(),
-                [("user", earlier), ("assistant", PARKED_TURN_RESPONSE), ("user", latest)]
-                    if earlier.ends_with(first_prompt) && latest.ends_with(follow_up)
+                [("assistant", answer), ("user", latest)]
+                    if *answer == PARKED_TURN_RESPONSE && latest.ends_with(follow_up)
             ),
-            "the follow-up runs on the transcript the detached turn persisted: {messages:?}"
+            "the steered round runs on the transcript its own turn already produced: {messages:?}"
         );
 
-        // The follow-up completes on the attached socket with its own response.
+        // The steered round completes and the one turn settles.
         fixture.release_next();
-        let done = loop {
-            let frame = next_text_frame(&mut second).await;
-            match frame["type"].as_str() {
-                Some("done") => break frame,
-                Some("error") => panic!("follow-up turn failed: {frame}"),
-                _ => {}
-            }
-        };
-        assert_eq!(done["full_response"], PARKED_TURN_RESPONSE);
         fixture.wait_for_turn_to_settle(&session_key).await;
 
         let transcript = fixture.backend.load(&session_key);
@@ -4211,7 +4314,7 @@ data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text
                     ("assistant", PARKED_TURN_RESPONSE),
                 ] if earlier.ends_with(first_prompt) && latest.ends_with(follow_up)
             ),
-            "both turns persist in order without duplication: {turns:?}"
+            "the steered message persists inside its turn, without duplication: {turns:?}"
         );
         drop(second);
         fixture.shutdown();

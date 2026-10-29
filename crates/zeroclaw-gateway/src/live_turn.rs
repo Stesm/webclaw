@@ -11,6 +11,19 @@
 //! so the snapshot has no state to preserve past the owning process.
 
 use std::sync::Arc;
+use tokio::sync::mpsc;
+use zeroclaw_runtime::agent::SteeringInput;
+
+/// Why a steering message could not join the running turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SteerRefusal {
+    /// The turn's steering queue is full.
+    Full,
+    /// The turn no longer accepts steering: it is finishing.
+    Closed,
+    /// The sender is not the principal that started the turn.
+    NotOwner,
+}
 
 /// A tool invocation accumulated during the running turn.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -32,13 +45,23 @@ pub struct TurnProgress {
     pub tool_calls: Vec<ToolProgress>,
 }
 
-/// The live turn for one session: its cancellation handle, identity, and the
-/// progress snapshot a reconnecting viewer reads.
+/// The live turn for one session: its cancellation handle, identity, its
+/// steering channel, and the progress snapshot a reconnecting viewer reads.
 pub struct ActiveTurn {
     token: tokio_util::sync::CancellationToken,
     #[allow(dead_code)]
     turn_id: String,
+    /// Principal that started the turn. `None` is the shared operator identity
+    /// (a gateway with no per-user auth): every socket is the same sender.
+    /// Otherwise a socket may steer only when it resolves to this subject, so
+    /// watching a turn never grants another principal a say in it.
+    owner: Option<String>,
     progress: parking_lot::Mutex<TurnProgress>,
+    /// The running turn's steering channel, attached by the socket that started
+    /// it so a socket that merely watches the turn (a reloaded tab, a second
+    /// pane) can still add a message to it. `None` before the turn's channel is
+    /// installed; a send then reports [`SteerRefusal::Closed`].
+    steering: parking_lot::Mutex<Option<mpsc::Sender<SteeringInput>>>,
 }
 
 impl ActiveTurn {
@@ -46,7 +69,48 @@ impl ActiveTurn {
         Self {
             token,
             turn_id,
+            owner: None,
             progress: parking_lot::Mutex::new(TurnProgress::default()),
+            steering: parking_lot::Mutex::new(None),
+        }
+    }
+
+    /// Bind the turn to the principal that started it.
+    pub fn with_owner(mut self, owner: Option<String>) -> Self {
+        self.owner = owner;
+        self
+    }
+
+    /// Install the running turn's steering channel.
+    pub fn set_steering(&self, sender: mpsc::Sender<SteeringInput>) {
+        *self.steering.lock() = Some(sender);
+    }
+
+    /// Queue one steering message on behalf of `subject`.
+    ///
+    /// The message joins the running turn as its own user turn before the next
+    /// model round; it never starts a second turn. Refusals are reported, never
+    /// queued behind: a full queue or a finishing turn would otherwise turn the
+    /// caller's message into an unbounded wait.
+    pub fn steer(&self, subject: Option<&str>, input: SteeringInput) -> Result<(), SteerRefusal> {
+        if !self.accepts_steering_from(subject) {
+            return Err(SteerRefusal::NotOwner);
+        }
+        let steering = self.steering.lock();
+        let Some(sender) = steering.as_ref() else {
+            return Err(SteerRefusal::Closed);
+        };
+        match sender.try_send(input) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(SteerRefusal::Full),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(SteerRefusal::Closed),
+        }
+    }
+
+    fn accepts_steering_from(&self, subject: Option<&str>) -> bool {
+        match self.owner.as_deref() {
+            None => true,
+            Some(owner) => subject == Some(owner),
         }
     }
 
@@ -181,5 +245,62 @@ mod tests {
         let progress = turn.progress();
         assert_eq!(progress.tool_calls.len(), 1);
         assert_eq!(progress.tool_calls[0].output.as_deref(), Some("out"));
+    }
+
+    #[test]
+    fn steering_is_closed_before_the_channel_is_installed() {
+        let turn = turn();
+        assert_eq!(
+            turn.steer(None, SteeringInput::new("hi".to_string())),
+            Err(SteerRefusal::Closed)
+        );
+    }
+
+    #[test]
+    fn steering_reaches_the_turn_queue_and_reports_a_full_one() {
+        let turn = turn();
+        let (tx, mut rx) = mpsc::channel(1);
+        turn.set_steering(tx);
+        assert_eq!(
+            turn.steer(None, SteeringInput::new("hi".to_string())),
+            Ok(())
+        );
+        assert_eq!(
+            turn.steer(None, SteeringInput::new("again".to_string())),
+            Err(SteerRefusal::Full)
+        );
+        assert_eq!(rx.try_recv().expect("queued").text(), "hi");
+    }
+
+    #[test]
+    fn steering_from_another_principal_is_refused() {
+        let turn = ActiveTurn::new("t".into(), tokio_util::sync::CancellationToken::new())
+            .with_owner(Some("alice".into()));
+        let (tx, _rx) = mpsc::channel(1);
+        turn.set_steering(tx);
+        assert_eq!(
+            turn.steer(None, SteeringInput::new("anon".to_string())),
+            Err(SteerRefusal::NotOwner)
+        );
+        assert_eq!(
+            turn.steer(Some("bob"), SteeringInput::new("wrong".to_string())),
+            Err(SteerRefusal::NotOwner)
+        );
+        assert_eq!(
+            turn.steer(Some("alice"), SteeringInput::new("ok".to_string())),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_dropped_receiver_is_reported_closed() {
+        let turn = turn();
+        let (tx, rx) = mpsc::channel::<SteeringInput>(1);
+        turn.set_steering(tx);
+        drop(rx);
+        assert_eq!(
+            turn.steer(None, SteeringInput::new("late".to_string())),
+            Err(SteerRefusal::Closed)
+        );
     }
 }

@@ -29,6 +29,10 @@ const storage = new MemoryStorage();
 const fakeWindow = {
   location: { protocol: 'http:', host: 'localhost' },
   dispatchEvent: () => true,
+  // The live-turn progress poller (`usePolling`) arms its timer through
+  // `window`; the renderer tests run on Node, where these live on globalThis.
+  setInterval: globalThis.setInterval.bind(globalThis),
+  clearInterval: globalThis.clearInterval.bind(globalThis),
 };
 const fakeDocument = {
   addEventListener: () => {},
@@ -1094,5 +1098,107 @@ test('session switch disconnects both the effect-owned and replacement sockets',
   });
   assert.equal(mounted.context().messages.some((message) =>
     message.content === 'stale replacement'), false);
+  await unmount(mounted.renderer);
+});
+
+test('a follow-up joins the running turn without resetting its stream', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const mounted = await mountChat(runtime);
+  await openSocket(runtime, 0);
+  await settle();
+
+  await act(async () => { mounted.context().sendMessage('Long task'); });
+  await act(async () => {
+    runtime.sockets[0]!.emitMessage({ type: 'chunk', content: 'partial answer' });
+  });
+  assert.equal(mounted.context().streamingContent, 'partial answer');
+
+  await act(async () => { mounted.context().sendFollowUp('Also open the second file'); });
+
+  assert.deepEqual(runtime.sockets[0]!.sent, ['Long task', 'Also open the second file']);
+  const followUp = () => mounted.context().messages
+    .find((message) => message.content === 'Also open the second file');
+  assert.equal(followUp()?.followUp, 'pending');
+  // The running turn's stream is untouched: a follow-up adds to it instead of
+  // starting a second turn.
+  assert.equal(mounted.context().streamingContent, 'partial answer');
+  assert.equal(mounted.context().typing, true);
+
+  await act(async () => {
+    runtime.sockets[0]!.emitMessage({ type: 'steer_accepted' });
+  });
+  assert.equal(followUp()?.followUp, 'accepted');
+  await unmount(mounted.renderer);
+});
+
+test('a follow-up the turn never accepted is marked lost', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const mounted = await mountChat(runtime);
+  await openSocket(runtime, 0);
+  await settle();
+
+  await act(async () => { mounted.context().sendMessage('Long task'); });
+  await act(async () => { mounted.context().sendFollowUp('Never delivered'); });
+  await act(async () => {
+    runtime.sockets[0]!.emitMessage({ type: 'done', full_response: 'finished' });
+  });
+
+  const followUp = mounted.context().messages
+    .find((message) => message.content === 'Never delivered');
+  assert.equal(followUp?.followUp, 'lost');
+  assert.equal(mounted.context().typing, false);
+  await unmount(mounted.renderer);
+});
+
+test('a refused follow-up leaves the running turn on screen', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const mounted = await mountChat(runtime);
+  await openSocket(runtime, 0);
+  await settle();
+
+  await act(async () => { mounted.context().sendMessage('Long task'); });
+  await act(async () => {
+    runtime.sockets[0]!.emitMessage({ type: 'chunk', content: 'partial answer' });
+  });
+  await act(async () => { mounted.context().sendFollowUp('Too late'); });
+  await act(async () => {
+    runtime.sockets[0]!.emitMessage({
+      type: 'error',
+      message: 'Running turn is no longer accepting steering messages',
+      code: 'STEERING_CLOSED',
+    });
+  });
+
+  const followUp = mounted.context().messages
+    .find((message) => message.content === 'Too late');
+  assert.equal(followUp?.followUp, 'lost');
+  // The refusal belongs to the message, not the turn: the turn keeps streaming.
+  assert.equal(mounted.context().typing, true);
+  assert.equal(mounted.context().streamingContent, 'partial answer');
+  await unmount(mounted.renderer);
+});
+
+test('the composer stays usable while watching a running turn', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const mounted = await mountChat(runtime, true);
+  await openSocket(runtime, 0);
+  await settle();
+
+  await act(async () => {
+    runtime.sockets[0]!.emitMessage({ type: 'session_start', session_id: 'A', running: true });
+  });
+  assert.equal(mounted.context().typing, true);
+  assert.equal(textarea(mounted.renderer).props.disabled, false);
+
+  await typeInComposer(mounted.renderer, 'add this to the turn');
+  const followUpButton = mounted.renderer.root.findAllByType('button')
+    .find((button) => button.props['aria-label'] === 'Add to the running turn');
+  assert.ok(followUpButton);
+  await act(async () => { followUpButton.props.onClick(); });
+  assert.deepEqual(runtime.sockets[0]!.sent, ['add this to the turn']);
   await unmount(mounted.renderer);
 });

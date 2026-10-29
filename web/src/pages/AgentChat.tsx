@@ -156,6 +156,7 @@ export function AgentChatInner({
   const {
     messages,
     sendMessage,
+    sendFollowUp,
     connected,
     error,
     typing,
@@ -420,12 +421,27 @@ export function AgentChatInner({
     // Network-dependent commands (/clear, /model) self-recover via their own
     // reconnect paths inside the context. #7137
     if (isSlashCommand(trimmed)) {
+      // A command during a running turn would pull the socket out from under
+      // the live stream (/model reconnects it) or cancel the turn (/clear), so
+      // hold it until the turn is over and keep the text in the field.
+      if (typing) {
+        addLocalMessage(t('agent.followup_wait'));
+        setShowCommandHint(false);
+        return;
+      }
       runCommand(trimmed);
     } else {
       if (!connected) return;
       // `//` is the documented escape for a literal leading slash (#7223);
       // strip one `/` so `//foo` is sent to the agent as `/foo`.
-      sendMessage(trimmed.startsWith('//') ? trimmed.slice(1) : trimmed);
+      const payload = trimmed.startsWith('//') ? trimmed.slice(1) : trimmed;
+      // A running turn keeps the field live: the same message adds to that turn
+      // (the gateway steers it in) instead of starting a second one.
+      if (typing) {
+        sendFollowUp(payload);
+      } else {
+        sendMessage(payload);
+      }
     }
     setShowCommandHint(false);
     writeInput('');
@@ -1017,23 +1033,41 @@ export function AgentChatInner({
                 : !hydrated
                   ? t('agent.session_loading')
                   : typing
-                    ? t('agent.running')
+                    ? t('agent.followup_placeholder')
                     : t('agent.type_message')}
-              disabled={!connected || typing || !hydrated}
+              disabled={!connected || !hydrated}
               className="flex-1 min-w-0 appearance-none bg-transparent px-1 text-sm text-pc-text resize-none placeholder:text-pc-text-muted disabled:opacity-40"
               style={{ minHeight: '32px', maxHeight: '200px', paddingTop: '6px', paddingBottom: '6px', outline: 'none' }}
             />
             {typing ? (
-              <Button
-                variant="danger"
-                size="sm"
-                onClick={handleAbort}
-                className="flex-shrink-0 w-8 h-8 px-0 appearance-none"
-                aria-label={t('agent.stop')}
-                title={t('agent.stop')}
-              >
-                <Square className="h-3.5 w-3.5" fill="currentColor" />
-              </Button>
+              <>
+                {/* A running turn keeps the field live: text in it is a
+                    follow-up the gateway folds into that same turn, so it gets
+                    its own send control next to the stop button rather than
+                    replacing it. */}
+                {input.trim() && (
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    onClick={handleSend}
+                    className="flex-shrink-0 w-8 h-8 px-0 appearance-none"
+                    aria-label={t('agent.send_followup')}
+                    title={t('agent.send_followup')}
+                  >
+                    <Send className="h-4 w-4" />
+                  </Button>
+                )}
+                <Button
+                  variant="danger"
+                  size="sm"
+                  onClick={handleAbort}
+                  className="flex-shrink-0 w-8 h-8 px-0 appearance-none"
+                  aria-label={t('agent.stop')}
+                  title={t('agent.stop')}
+                >
+                  <Square className="h-3.5 w-3.5" fill="currentColor" />
+                </Button>
+              </>
             ) : (
               <Button
                 variant="primary"
@@ -1175,6 +1209,12 @@ const MessageItem = memo(function MessageItem({
               onPreview={onPreviewAttachment}
             />
           ))}
+          {msg.followUp === 'pending' && (
+            <p className="text-[10px] mt-1 text-pc-text-muted">{t('agent.followup_pending')}</p>
+          )}
+          {msg.followUp === 'lost' && (
+            <p className="text-[10px] mt-1 text-status-warning">{t('agent.followup_lost')}</p>
+          )}
           {!compact && (
             <p className="text-[10px] mt-1.5 text-pc-text-faint">
               {msg.timestamp.toLocaleTimeString()}

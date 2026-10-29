@@ -252,7 +252,8 @@ export interface WsMessage {
     | "safeguard_fallback"
     | "aborted"
     | "turn_done"
-    | "turn_in_progress";
+    | "turn_in_progress"
+    | "steer_accepted";
   content?: string;
   full_response?: string;
   name?: string;
