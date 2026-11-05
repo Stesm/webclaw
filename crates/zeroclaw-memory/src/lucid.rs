@@ -563,6 +563,14 @@ impl Memory for LucidMemory {
         self.local.count().await
     }
 
+    async fn count_entries(
+        &self,
+        category: Option<&MemoryCategory>,
+        allowed_agent_ids: &[&str],
+    ) -> anyhow::Result<usize> {
+        self.local.count_entries(category, allowed_agent_ids).await
+    }
+
     async fn health_check(&self) -> bool {
         self.local.health_check().await
     }

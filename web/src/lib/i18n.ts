@@ -2079,6 +2079,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'dashboard.mem.sort.key_desc': 'Key Z → A',
     'dashboard.mem.loading': 'Loading memories…',
     'dashboard.mem.heading': 'Memories',
+    'dashboard.mem.partial': 'Only the most recent entries are listed. The second number is the real total.',
+    'dashboard.mem.partial_hint': 'Showing the most recent entries only — the counter shows the full total.',
     'dashboard.mem.add_title': 'Add a memory entry',
     'dashboard.mem.search_title': 'Backend-side recall — searches across the configured memory store. Combined with the agent and category filters.',
     'dashboard.mem.search_aria': 'Search memories',

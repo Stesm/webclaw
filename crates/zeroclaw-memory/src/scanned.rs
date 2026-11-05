@@ -521,6 +521,14 @@ impl<M: Memory> Memory for ScannedMemory<M> {
         self.inner.count().await
     }
 
+    async fn count_entries(
+        &self,
+        category: Option<&MemoryCategory>,
+        allowed_agent_ids: &[&str],
+    ) -> anyhow::Result<usize> {
+        self.inner.count_entries(category, allowed_agent_ids).await
+    }
+
     async fn health_check(&self) -> bool {
         self.inner.health_check().await
     }

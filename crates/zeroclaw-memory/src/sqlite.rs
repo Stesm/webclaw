@@ -2402,6 +2402,49 @@ impl Memory for SqliteMemory {
         .await?
     }
 
+    async fn count_entries(
+        &self,
+        category: Option<&MemoryCategory>,
+        allowed_agent_ids: &[&str],
+    ) -> anyhow::Result<usize> {
+        // The same predicate `list` applies, minus its `LIMIT`: only active,
+        // non-private rows are listed, so only those are counted.
+        let conn = self.conn.clone();
+        let category = category.map(Self::category_to_str);
+        let agent_ids: Vec<String> = allowed_agent_ids
+            .iter()
+            .map(|id| (*id).to_string())
+            .collect();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let conn = conn.lock();
+            let mut sql = String::from(
+                "SELECT COUNT(*) FROM memories \
+                 WHERE superseded_by IS NULL AND principal_id IS NULL",
+            );
+            let mut values: Vec<rusqlite::types::Value> = Vec::new();
+            if let Some(cat) = category {
+                values.push(rusqlite::types::Value::Text(cat));
+                sql.push_str(&format!(" AND category = ?{}", values.len()));
+            }
+            if !agent_ids.is_empty() {
+                let placeholders = (0..agent_ids.len())
+                    .map(|offset| format!("?{}", values.len() + offset + 1))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                values.extend(agent_ids.into_iter().map(rusqlite::types::Value::Text));
+                sql.push_str(&format!(" AND agent_id IN ({placeholders})"));
+            }
+            let count: i64 =
+                conn.query_row(&sql, rusqlite::params_from_iter(values.iter()), |row| {
+                    row.get(0)
+                })?;
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            Ok(count as usize)
+        })
+        .await?
+    }
+
     async fn health_check(&self) -> bool {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || conn.lock().execute_batch("SELECT 1").is_ok())
@@ -5438,6 +5481,90 @@ mod tests {
             assert_eq!(results[0].key, "k1");
             assert_eq!(results[0].session_id.as_deref(), Some("sess-x"));
         }
+    }
+
+    #[tokio::test]
+    async fn count_entries_counts_past_the_list_page_limit() {
+        let (_tmp, mem) = temp_sqlite();
+        let agent = mem.ensure_agent_uuid("bulk").await.unwrap();
+        {
+            // The list path pages at 1000 rows; the count must not.
+            let conn = mem.conn.lock();
+            conn.execute_batch("BEGIN").unwrap();
+            {
+                let mut stmt = conn
+                    .prepare(
+                        "INSERT INTO memories (id, key, content, category, created_at, updated_at, agent_id) \
+                         VALUES (?1, ?2, ?3, 'core', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', ?4)",
+                    )
+                    .unwrap();
+                for idx in 0..1005 {
+                    stmt.execute(params![
+                        format!("id-{idx}"),
+                        format!("key-{idx}"),
+                        format!("body {idx}"),
+                        agent.as_str()
+                    ])
+                    .unwrap();
+                }
+            }
+            conn.execute_batch("COMMIT").unwrap();
+        }
+
+        assert_eq!(mem.list(None, None).await.unwrap().len(), 1000);
+        assert_eq!(mem.count_entries(None, &[]).await.unwrap(), 1005);
+        assert_eq!(
+            mem.count_entries(Some(&MemoryCategory::Core), &[])
+                .await
+                .unwrap(),
+            1005
+        );
+        assert_eq!(
+            mem.count_entries(Some(&MemoryCategory::Daily), &[])
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn count_entries_scopes_to_the_given_agents() {
+        let (_tmp, mem) = temp_sqlite();
+        let alpha = mem.ensure_agent_uuid("alpha").await.unwrap();
+        let beta = mem.ensure_agent_uuid("beta").await.unwrap();
+        for (key, agent) in [("a1", &alpha), ("a2", &alpha), ("b1", &beta)] {
+            mem.store_with_agent(
+                key,
+                key,
+                MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(agent),
+            )
+            .await
+            .unwrap();
+        }
+        // An unattributed row is invisible to a scoped list, so it stays out of
+        // the scoped count too.
+        mem.store("loose", "loose", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        assert_eq!(mem.count_entries(None, &[]).await.unwrap(), 4);
+        assert_eq!(mem.count_entries(None, &[alpha.as_str()]).await.unwrap(), 2);
+        assert_eq!(
+            mem.count_entries(None, &[alpha.as_str(), beta.as_str()])
+                .await
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            mem.count_entries(Some(&MemoryCategory::Daily), &[alpha.as_str()])
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]

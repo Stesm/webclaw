@@ -47,7 +47,7 @@ import {
   getSessionMessages,
   deleteSession,
   renameSession,
-  getMemory,
+  getMemoryPage,
   storeMemory,
   deleteMemory,
   getMapKeys,
@@ -2374,6 +2374,9 @@ function isMemorySort(v: string): v is MemorySort {
 
 function MemoriesTab() {
   const [entries, setEntries] = useState<MemoryEntry[]>([]);
+  // Real number of matching entries. `entries` is the backend's page, which
+  // SQL backends cap at 1000; this is the count the header shows.
+  const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [searchParams, setSearchParams] = useSearchParams();
@@ -2427,13 +2430,14 @@ function MemoriesTab() {
 
   const reload = useCallback(() => {
     setLoading(true);
-    getMemory(
+    getMemoryPage(
       debouncedQuery.trim() || undefined,
       categoryFilter || undefined,
       agentFilter || undefined,
     )
-      .then((rows) => {
-        setEntries(rows);
+      .then((page) => {
+        setEntries(page.entries);
+        setTotal(page.total);
         setLoading(false);
       })
       .catch((err: unknown) => {
@@ -2575,10 +2579,13 @@ function MemoriesTab() {
             background: "rgba(var(--pc-accent-rgb), 0.1)",
             color: "var(--pc-accent)",
           }}
+          title={
+            total > entries.length ? t("dashboard.mem.partial") : undefined
+          }
         >
-          {visibleEntries.length}
-          {visibleEntries.length !== entries.length
-            ? ` / ${entries.length}`
+          {visibleEntries.length.toLocaleString()}
+          {total > visibleEntries.length
+            ? ` / ${total.toLocaleString()}`
             : ""}
         </span>
         <button
@@ -2675,6 +2682,12 @@ function MemoriesTab() {
           </div>
         </div>
       </div>
+
+      {entries.length < total && (
+        <p className="text-xs" style={{ color: "var(--pc-text-muted)" }}>
+          {t("dashboard.mem.partial_hint")}
+        </p>
+      )}
 
       {visibleEntries.length === 0 ? (
         <p

@@ -431,6 +431,14 @@ impl Memory for RetrievalPipeline {
         self.memory.count().await
     }
 
+    async fn count_entries(
+        &self,
+        category: Option<&MemoryCategory>,
+        allowed_agent_ids: &[&str],
+    ) -> anyhow::Result<usize> {
+        self.memory.count_entries(category, allowed_agent_ids).await
+    }
+
     async fn health_check(&self) -> bool {
         self.memory.health_check().await
     }

@@ -2094,22 +2094,59 @@ export function runDoctor(): Promise<DiagResult[]> {
 // Memory
 // ---------------------------------------------------------------------------
 
-export function getMemory(
+export interface MemoryPage {
+  /** The page of entries the backend returned (SQL backends cap it). */
+  entries: MemoryEntry[];
+  /**
+   * Real number of entries matching the request. Larger than
+   * `entries.length` when the backend paged its list; equal in search mode,
+   * where recall returns a bounded, scored result set instead of a listing.
+   */
+  total: number;
+}
+
+export function getMemoryPage(
   query?: string,
   category?: string,
   agent?: string,
-): Promise<MemoryEntry[]> {
+): Promise<MemoryPage> {
   const params = new URLSearchParams();
   if (query) params.set("query", query);
   if (category) params.set("category", category);
   if (agent) params.set("agent", agent);
   const qs = params.toString();
-  return apiFetch<MemoryEntry[] | { entries: MemoryEntry[] }>(
+  return apiFetch<MemoryEntry[] | { entries: MemoryEntry[]; total?: number }>(
     `/api/memory${qs ? `?${qs}` : ""}`,
   ).then((data) => {
     const result = unwrapField(data, "entries");
-    return Array.isArray(result) ? result : [];
+    const entries = Array.isArray(result) ? result : [];
+    const total =
+      !Array.isArray(data) && typeof data.total === "number"
+        ? data.total
+        : entries.length;
+    return { entries, total };
   });
+}
+
+export function getMemory(
+  query?: string,
+  category?: string,
+  agent?: string,
+): Promise<MemoryEntry[]> {
+  return getMemoryPage(query, category, agent).then((page) => page.entries);
+}
+
+/**
+ * Real number of entries for one agent (or the install-wide store when
+ * `agent` is omitted), without downloading the page of entries. The backend
+ * counts past its list page limit, so this is the figure to show as a total.
+ */
+export function getMemoryCount(agent?: string): Promise<number> {
+  const params = new URLSearchParams({ count_only: "true" });
+  if (agent) params.set("agent", agent);
+  return apiFetch<{ total?: number }>(`/api/memory?${params.toString()}`).then(
+    (data) => (typeof data.total === "number" ? data.total : 0),
+  );
 }
 
 export function storeMemory(

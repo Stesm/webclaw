@@ -461,8 +461,30 @@ impl Memory for AgentScopedMemory {
     async fn count(&self) -> Result<usize> {
         // Scope to the bound + allowlisted agents so a wrapper-using
         // caller does not see the install-wide row total.
-        let entries = self.inner.list(None, None).await?;
-        Ok(self.filter_attributed_entries(entries).len())
+        self.count_entries(None, &[]).await
+    }
+
+    async fn count_entries(
+        &self,
+        category: Option<&MemoryCategory>,
+        allowed_agent_ids: &[&str],
+    ) -> Result<usize> {
+        // The wrapper's allowlist is the source of truth for what its `list`
+        // may surface; a caller-supplied filter can only narrow it. Counting
+        // through the inner backend keeps a paged list from capping the total.
+        let owned = self.allowed_slice();
+        let ids: Vec<&str> = if allowed_agent_ids.is_empty() {
+            owned
+        } else {
+            owned
+                .into_iter()
+                .filter(|id| allowed_agent_ids.contains(id))
+                .collect()
+        };
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        self.inner.count_entries(category, &ids).await
     }
 
     async fn purge_namespace(&self, namespace: &str) -> Result<usize> {
@@ -1262,6 +1284,54 @@ mod tests {
         assert!(
             !entries.iter().any(|e| e.key == "rogue-row"),
             "list must drop rows attributed to non-allowlisted agents"
+        );
+    }
+
+    #[tokio::test]
+    async fn count_entries_scopes_to_the_wrappers_allowlist() {
+        let (_tmp, inner) = fresh_sqlite();
+        let uuids = provision_agents(&inner, &["alpha", "beta", "rogue"]).await;
+        let alpha_uuid = &uuids[0];
+        let beta_uuid = &uuids[1];
+        let rogue_uuid = &uuids[2];
+
+        for (key, owner) in [
+            ("alpha-1", alpha_uuid),
+            ("alpha-2", alpha_uuid),
+            ("beta-1", beta_uuid),
+            ("rogue-1", rogue_uuid),
+        ] {
+            inner
+                .store_with_agent(
+                    key,
+                    "v",
+                    MemoryCategory::Core,
+                    None,
+                    None,
+                    None,
+                    Some(owner),
+                )
+                .await
+                .unwrap();
+        }
+
+        let wrapper = AgentScopedMemory::new(as_dyn(inner), alpha_uuid, vec![beta_uuid.clone()]);
+
+        assert_eq!(wrapper.count().await.unwrap(), 3);
+        assert_eq!(wrapper.count_entries(None, &[]).await.unwrap(), 3);
+        assert_eq!(
+            wrapper
+                .count_entries(None, &[alpha_uuid.as_str()])
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            wrapper
+                .count_entries(Some(&MemoryCategory::Daily), &[])
+                .await
+                .unwrap(),
+            0
         );
     }
 

@@ -1,4 +1,4 @@
-import { getCost, getMapKeys, getMemory, getSessions, listProps, patchConfig } from './api';
+import { getCost, getMapKeys, getMemoryCount, getSessions, listProps, patchConfig } from './api';
 
 export interface AgentSummary {
   alias: string;
@@ -64,12 +64,11 @@ export async function loadAgentSummaries(): Promise<AgentSummary[]> {
   const { keys } = await getMapKeys('agents');
   if (keys.length === 0) return [];
 
-  // Fetch sessions + cost + memories in parallel with per-agent prop
-  // lookups. Falls back to empty/null if any endpoint errors so a partial
-  // outage doesn't blank the agents page.
+  // Fetch sessions + cost in parallel with per-agent prop lookups. Falls back
+  // to empty/null if any endpoint errors so a partial outage doesn't blank the
+  // agents page.
   const sessionsPromise = getSessions().catch(() => []);
   const costPromise = getCost().catch(() => null);
-  const memoriesPromise = getMemory().catch(() => []);
 
   // Reverse-build agent → peer_groups in parallel with the per-agent walks.
   // listProps('peer_groups.<alias>.agents') is the field that names members.
@@ -94,6 +93,9 @@ export async function loadAgentSummaries(): Promise<AgentSummary[]> {
   const summaries = await Promise.all(
     keys.map(async (alias): Promise<AgentSummary> => {
       const { entries } = await listProps(`agents.${alias}`);
+      // The backend counts past its list page limit, so this is the agent's
+      // real memory total, not the number of rows that fit on one page.
+      const memoryCount = await getMemoryCount(alias).catch(() => 0);
       // Configurable-macro paths are kebab-case (snake field names
       // converted via snake_to_kebab in zeroclaw-macros).
       const lookup = (suffixKebab: string) =>
@@ -118,23 +120,16 @@ export async function loadAgentSummaries(): Promise<AgentSummary[]> {
         sessionCount: 0,
         lastActivity: null,
         monthCostUsd: null,
-        memoryCount: 0,
+        memoryCount,
       };
     }),
   );
 
-  const [sessions, cost, peerGroups, memories] = await Promise.all([
+  const [sessions, cost, peerGroups] = await Promise.all([
     sessionsPromise,
     costPromise,
     peerGroupsPromise,
-    memoriesPromise,
   ]);
-  const memoriesByAgent = memories.reduce<Record<string, number>>((acc, m) => {
-    if (m.agent_alias) {
-      acc[m.agent_alias] = (acc[m.agent_alias] ?? 0) + 1;
-    }
-    return acc;
-  }, {});
   for (const summary of summaries) {
     const owned = sessions.filter((s) => s.agent_alias === summary.alias);
     summary.sessionCount = owned.length;
@@ -146,7 +141,6 @@ export async function loadAgentSummaries(): Promise<AgentSummary[]> {
     const agentCost = cost?.by_agent?.[summary.alias];
     summary.monthCostUsd = agentCost ? agentCost.cost_usd : null;
     summary.peerGroups = peerGroups[summary.alias] ?? [];
-    summary.memoryCount = memoriesByAgent[summary.alias] ?? 0;
   }
 
   return summaries;

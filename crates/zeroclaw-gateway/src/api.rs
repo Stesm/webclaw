@@ -87,6 +87,11 @@ pub struct MemoryQuery {
     /// etc.). Omit for the install-wide view.
     #[serde(default)]
     pub agent: Option<String>,
+    /// Return only the real number of matching entries as `{"total": N}`,
+    /// without the page of entries. `total` ignores the backend's list page
+    /// limit, so a caller can tell "1000 of 1116" apart from "1000".
+    #[serde(default)]
+    pub count_only: bool,
 }
 
 #[derive(Deserialize)]
@@ -1150,6 +1155,26 @@ pub async fn handle_api_memory_list(
         Err(e) => return e.into_response(),
     };
 
+    let category = params.category.as_deref().map(|cat| match cat {
+        "core" => zeroclaw_memory::MemoryCategory::Core,
+        "daily" => zeroclaw_memory::MemoryCategory::Daily,
+        "conversation" => zeroclaw_memory::MemoryCategory::Conversation,
+        other => zeroclaw_memory::MemoryCategory::Custom(other.to_string()),
+    });
+
+    // Count-only mode: the dashboard asks for one agent's real total without
+    // pulling that agent's page of entries.
+    if params.count_only {
+        return match mem.count_entries(category.as_ref(), &[]).await {
+            Ok(total) => Json(serde_json::json!({ "total": total })).into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Memory count failed: {e}")})),
+            )
+                .into_response(),
+        };
+    }
+
     // Use recall when query or time range is provided
     if params.query.is_some() || params.since.is_some() || params.until.is_some() {
         let query = params.query.as_deref().unwrap_or("");
@@ -1176,17 +1201,24 @@ pub async fn handle_api_memory_list(
                 .into_response(),
         }
     } else {
-        // List mode
-        let category = params.category.as_deref().map(|cat| match cat {
-            "core" => zeroclaw_memory::MemoryCategory::Core,
-            "daily" => zeroclaw_memory::MemoryCategory::Daily,
-            "conversation" => zeroclaw_memory::MemoryCategory::Conversation,
-            other => zeroclaw_memory::MemoryCategory::Custom(other.to_string()),
-        });
-
+        // List mode. `list` is a page (SQL backends return their most recent
+        // 1000 rows); `total` is the real number of matching entries so the
+        // dashboard can say "1000 of 1116" instead of presenting the page as
+        // the whole store.
+        let total = match mem.count_entries(category.as_ref(), &[]).await {
+            Ok(total) => total,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Memory count failed: {e}")})),
+                )
+                    .into_response();
+            }
+        };
         match mem.list(category.as_ref(), None).await {
             Ok(entries) => Json(serde_json::json!({
-                "entries": sanitize_memory_entries_for_api(entries)
+                "entries": sanitize_memory_entries_for_api(entries),
+                "total": total
             }))
             .into_response(),
             Err(e) => (
@@ -2823,6 +2855,7 @@ pub(crate) mod tests {
                 since: None,
                 until: None,
                 agent: None,
+                count_only: false,
             }),
         )
         .await
@@ -2835,7 +2868,37 @@ pub(crate) mod tests {
         assert!(content.ends_with("..."));
         assert_eq!(json["entries"][0]["key"], "huge-memory");
         assert_eq!(json["entries"][0]["category"], "conversation");
+        assert_eq!(json["total"], 1);
         assert_ne!(content, huge);
+    }
+
+    #[tokio::test]
+    async fn handle_api_memory_count_only_returns_the_total_without_the_page() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        let state = test_state_with_memory(config, vec![memory_entry_with_content("first".into())]);
+
+        let response = handle_api_memory_list(
+            State(state),
+            HeaderMap::new(),
+            Query(MemoryQuery {
+                query: None,
+                category: None,
+                since: None,
+                until: None,
+                agent: None,
+                count_only: true,
+            }),
+        )
+        .await
+        .into_response();
+
+        let json = response_json(response).await;
+        assert_eq!(json["total"], 1);
+        assert!(
+            json.get("entries").is_none(),
+            "count-only mode must not carry the page: {json}"
+        );
     }
 
     #[tokio::test]
@@ -2854,6 +2917,7 @@ pub(crate) mod tests {
                 since: None,
                 until: None,
                 agent: None,
+                count_only: false,
             }),
         )
         .await

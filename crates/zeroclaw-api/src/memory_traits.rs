@@ -553,6 +553,42 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     /// Count total memories
     async fn count(&self) -> anyhow::Result<usize>;
 
+    /// Count the rows a [`list`](Self::list) call with this category would
+    /// return, ignoring any page limit the backend applies to `list` itself.
+    ///
+    /// `list` is page-shaped: SQLite returns at most its most recent 1000 rows
+    /// and Qdrant scrolls a single 1000-point page. A caller that has to tell
+    /// "this is everything" apart from "this is the first page" — the
+    /// dashboard's memory tab, for instance — cannot use `list().len()` for
+    /// that. This is that count.
+    ///
+    /// `allowed_agent_ids` restricts the count to rows attributed to those
+    /// agent UUIDs (an empty slice counts every row). It mirrors the filter
+    /// the agent-scoped memory wrapper applies to its own `list`; the bound
+    /// agent's handle passes its allowlist here instead of leaking the
+    /// install-wide total.
+    ///
+    /// The default implementation counts the rows `list` returns, so it is
+    /// exact only for backends whose `list` is already unbounded. Paged
+    /// backends override it with a native count.
+    async fn count_entries(
+        &self,
+        category: Option<&MemoryCategory>,
+        allowed_agent_ids: &[&str],
+    ) -> anyhow::Result<usize> {
+        let entries = self.list(category, None).await?;
+        if allowed_agent_ids.is_empty() {
+            return Ok(entries.len());
+        }
+        Ok(entries
+            .iter()
+            .filter(|entry| match entry.agent_id.as_deref() {
+                None => false,
+                Some(id) => allowed_agent_ids.contains(&id),
+            })
+            .count())
+    }
+
     /// Health check
     async fn health_check(&self) -> bool;
 
