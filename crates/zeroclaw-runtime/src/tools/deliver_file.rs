@@ -182,7 +182,9 @@ impl Tool for DeliverFileTool {
          when the user should download or preview a file you created or found. Path must stay \
          inside the workspace. On success the result includes `uri` \
          (`attachment://deliver/<content-hash>`) — cite that exact uri in widgets/`[N]`; \
-         do not invent prefixes. Pass an optional `title` (any prose) as the client's \
+         do not invent prefixes. Never write the uri in your reply text: it is a \
+         machine-readable field, not prose, and a client that renders citations strips it \
+         back out. Pass an optional `title` (any prose) as the client's \
          chat label for the file; it defaults to the filename. Do not invent ACP \
          filename fields."
     }
