@@ -1626,6 +1626,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.compact_mode': 'Compact',
     'agent.tool_activity_show': 'Show tool activity',
     'agent.tool_activity_hide': 'Hide tool activity',
+    'agent.thinking_keep_collapsed': 'Keep thinking collapsed',
     'agent.running': 'Running…',
     // Follow-ups into a turn that is already streaming
     'agent.followup_placeholder': 'Add to the running turn…',
