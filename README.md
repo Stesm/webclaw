@@ -13,8 +13,9 @@
 > Зеркала: [github.com/Stesm/webclaw](https://github.com/Stesm/webclaw) ·
 > [git.alfastat.ru/root/webclaw](https://git.alfastat.ru/root/webclaw)
 >
-> База: upstream `master` @ `d8d5d93f5` (пакет `v0.8.5`) + короткий стек
-> коммитов форка в ветке `fork-work`.
+> База: upstream `v0.8.6` + выборочные cherry-pick'и фиксов из `v0.8.7` и
+> `v0.9.0` (полного мержа апстрима нет) и стек коммитов форка. Сборка
+> сообщает версию `0.9.0`, чтобы дашборд не предлагал обновление на апстрим.
 
 <p align="center">
   <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache%202.0-blue.svg" alt="License" /></a>
