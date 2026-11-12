@@ -568,7 +568,6 @@ mod tests {
             0,
             None,
             None,
-            None,
         )
         .await;
         provider.temperatures.lock().unwrap().clone()
