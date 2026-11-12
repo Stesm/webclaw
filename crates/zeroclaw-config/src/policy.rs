@@ -10472,13 +10472,21 @@ mod tests {
         assert!(policy.is_resolved_path_readable(&ok_alias));
         assert!(policy.is_resolved_path_allowed(&ok_alias));
 
-        for (name, target) in [
+        for (index, (name, target)) in [
             ("nul", &secret),
             ("NUL", &outside),
             (r"\\.\nul", &secret),
             (r"\\.\NUL", &outside),
-        ] {
-            let alias = workspace.join(name);
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // A case-insensitive filesystem (the macOS default) treats `nul`
+            // and `NUL` as the same directory entry, so each alias gets its
+            // own directory to keep both spellings alive on one host.
+            let alias_dir = workspace.join(format!("alias-{index}"));
+            std::fs::create_dir_all(&alias_dir).unwrap();
+            let alias = alias_dir.join(name);
             symlink(target, &alias).unwrap();
             assert_eq!(
                 policy.resolve_policy_target(&alias),
