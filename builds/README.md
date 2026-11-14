@@ -9,7 +9,7 @@
 | файл | платформа | назначение |
 |---|---|---|
 | `zeroclaw-x86_64-apple-darwin.tar.gz` | macOS x86_64 | Mac mini |
-| `zeroclaw-aarch64-unknown-linux-gnu.tar.gz` | linux arm64 | контейнер shelfy-trader |
+| `zeroclaw-aarch64-unknown-linux-musl.tar.gz` | linux arm64, статик (musl) | контейнер shelfy-trader (glibc-независимый) |
 | `SHA256SUMS` | — | контрольные суммы архивов |
 
 Внутри каждого архива — бинарь `zeroclaw`. Проверка:
