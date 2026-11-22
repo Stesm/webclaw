@@ -1855,17 +1855,7 @@ fn first_chat_message_content(text: &str) -> Option<String> {
 }
 
 fn event_matches_session(event: &serde_json::Value, session_id: &str) -> bool {
-    match event.get("session_id").and_then(|value| value.as_str()) {
-        Some(event_session_id) => event_session_id == session_id,
-        None => is_global_chat_event(event),
-    }
-}
-
-fn is_global_chat_event(event: &serde_json::Value) -> bool {
-    matches!(
-        event.get("type").and_then(serde_json::Value::as_str),
-        Some("cron_result")
-    )
+    event.get("session_id").and_then(|value| value.as_str()) == Some(session_id)
 }
 
 fn is_observability_telemetry(event: &serde_json::Value) -> bool {
@@ -5152,13 +5142,13 @@ data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text
             "session_id": "operator-2",
             "content": "different session"
         });
-        // No session_id and not on the global whitelist → dropped.
+        // No session_id → dropped.
         let nameless_observability = serde_json::json!({
             "type": "agent_start",
             "source": "observability",
             "model": "gpt-4o"
         });
-        // No session_id but on the global whitelist (`cron_result`) → forwarded.
+        // No session_id → dropped, including cron results.
         let cron = serde_json::json!({
             "type": "cron_result",
             "output": "global notification"
@@ -5170,11 +5160,11 @@ data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text
             &nameless_observability,
             "operator-1"
         ));
-        assert!(event_matches_session(&cron, "operator-1"));
+        assert!(!event_matches_session(&cron, "operator-1"));
     }
 
     #[test]
-    fn event_matches_session_defaults_drops_unwhitelisted_no_session_frames() {
+    fn event_matches_session_drops_all_no_session_frames() {
         // The pre-contract was `None => true`, which silently leaked
         // every BroadcastObserver telemetry frame (including `error`) into
         // every chat WebSocket. The fix flips the default; verify each
