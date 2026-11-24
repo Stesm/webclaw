@@ -927,6 +927,15 @@ pub(crate) async fn try_compute_drift(
     })?;
     on_disk.config_path = path.clone();
 
+    // The loader force-merges the built-in default `auto_approve` entries into
+    // an existing `risk_profiles.default` (see `Config::load`). Comparing the
+    // raw disk form would then report drift on every release that ships a new
+    // default tool, and no restart can clear it. Mirror the merge so both
+    // sides describe how the daemon actually resolves the profile.
+    if let Some(profile) = on_disk.risk_profiles.get_mut("default") {
+        profile.ensure_default_auto_approve();
+    }
+
     let in_memory_props: std::collections::HashMap<String, zeroclaw_config::traits::PropFieldInfo> =
         in_memory
             .prop_fields()
@@ -5603,6 +5612,36 @@ mod tests {
             );
             assert!(drift.is_empty(), "{raw}: {drift:?}");
         }
+    }
+
+    /// The loader force-merges the built-in `auto_approve` defaults into an
+    /// existing `risk_profiles.default`, so a stored profile that predates a
+    /// newly shipped default tool must not show up as disk drift — no restart
+    /// could ever clear that banner.
+    #[tokio::test]
+    async fn compute_drift_ignores_the_forced_default_auto_approve_merge() {
+        let version = zeroclaw_config::migration::CURRENT_SCHEMA_VERSION;
+        let raw = format!(
+            "schema_version = {version}\n[risk_profiles.default]\nlevel = \"full\"\n\
+             auto_approve = [\"file_read\"]\n"
+        );
+        let (_tmp, path) = temp_config_path();
+        tokio::fs::write(&path, &raw).await.unwrap();
+
+        let mut cfg = zeroclaw_config::migration::migrate_to_current_salvaged(&raw).config;
+        cfg.config_path = path.clone();
+        cfg.risk_profiles
+            .get_mut("default")
+            .expect("default profile")
+            .ensure_default_auto_approve();
+
+        let drift = try_compute_drift(&cfg).await.expect("drift");
+        assert!(
+            drift
+                .iter()
+                .all(|entry| entry.path != "risk_profiles.default.auto_approve"),
+            "{drift:?}"
+        );
     }
 
     #[tokio::test]
