@@ -346,19 +346,56 @@ impl SqliteSessionBackend {
         session_key: &str,
         messages: &[ChatMessage],
     ) -> rusqlite::Result<()> {
+        // The caller's in-memory history carries no attachment metadata, so a
+        // plain rebuild would drop the files every earlier turn delivered.
+        // Reattach them to the retained rows by matching role and content,
+        // scanning from the end so appended turns keep their identity.
+        let preserved = Self::attachment_rows_on(conn, session_key)?;
         conn.execute(
             "DELETE FROM sessions WHERE session_key = ?1",
             params![session_key],
         )?;
         let now = Utc::now().to_rfc3339();
-        for message in messages {
-            Self::append_on(conn, session_key, message, None, &now)?;
+        let mut restored: Vec<Option<String>> = vec![None; messages.len()];
+        let mut cursor = messages.len();
+        for (role, content, attachments_json) in preserved.into_iter().rev() {
+            while cursor > 0 {
+                cursor -= 1;
+                if messages[cursor].role == role && messages[cursor].content == content {
+                    restored[cursor] = Some(attachments_json);
+                    break;
+                }
+            }
+        }
+        for (message, attachments_json) in messages.iter().zip(restored.iter()) {
+            Self::append_on(
+                conn,
+                session_key,
+                message,
+                attachments_json.as_deref(),
+                &now,
+            )?;
         }
         conn.execute(
             "UPDATE session_metadata SET message_count = ?2 WHERE session_key = ?1",
             params![session_key, messages.len() as i64],
         )?;
         Ok(())
+    }
+
+    fn attachment_rows_on(
+        conn: &Connection,
+        session_key: &str,
+    ) -> rusqlite::Result<Vec<(String, String, String)>> {
+        let mut stmt = conn.prepare(
+            "SELECT role, content, attachments FROM sessions
+             WHERE session_key = ?1 AND attachments IS NOT NULL
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![session_key], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        rows.collect()
     }
 
     fn set_session_trim_breadcrumb_on(
@@ -1907,6 +1944,66 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert!(rows[0].attachments.is_empty());
         assert_eq!(rows[1].attachments, vec![attachment]);
+    }
+
+    #[test]
+    fn rewrite_keeps_attachments_on_retained_rows() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let attachment = AttachmentRef {
+            id: "abc123.pdf".to_string(),
+            filename: "report.pdf".to_string(),
+            title: "Quarterly report".to_string(),
+            mime: "application/pdf".to_string(),
+            size: 42,
+        };
+
+        backend.append("s", &ChatMessage::user("first")).unwrap();
+        backend
+            .append_with_attachments(
+                "s",
+                &ChatMessage::assistant("report"),
+                std::slice::from_ref(&attachment),
+            )
+            .unwrap();
+        backend.append("s", &ChatMessage::user("second")).unwrap();
+        backend
+            .append("s", &ChatMessage::assistant("latest"))
+            .unwrap();
+
+        backend
+            .rewrite_messages(
+                "s",
+                &[
+                    ChatMessage::user("first"),
+                    ChatMessage::assistant("report"),
+                    ChatMessage::user("second"),
+                    ChatMessage::assistant("latest"),
+                    ChatMessage::user("third"),
+                ],
+            )
+            .unwrap();
+
+        let rows = backend.load_with_timestamps("s");
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[1].attachments, vec![attachment.clone()]);
+        assert!(rows[3].attachments.is_empty());
+
+        backend
+            .rewrite_messages(
+                "s",
+                &[
+                    ChatMessage::assistant("report"),
+                    ChatMessage::user("second"),
+                    ChatMessage::assistant("latest"),
+                    ChatMessage::user("third"),
+                ],
+            )
+            .unwrap();
+
+        let rows = backend.load_with_timestamps("s");
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].attachments, vec![attachment]);
     }
 
     /// The authoritative post-turn replace rebuilds rows without attachment
