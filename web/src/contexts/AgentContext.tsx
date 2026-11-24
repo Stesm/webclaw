@@ -48,6 +48,7 @@ import {
   uiMessagesToPersisted,
 } from '@/lib/chatHistoryStorage';
 import { usePolling } from '@/hooks/usePolling';
+import { RENDER_CHART_TOOL } from '@/components/chatChart.logic';
 
 export interface ChatMessage {
   id: string;
@@ -673,7 +674,9 @@ export function AgentProvider({
         // with a spinner that never resolves (no matching `tool_result`). The
         // backend already filters these out, but ignore them here too so a
         // malformed telemetry frame can never render a stuck card.
-        if (!msg.name) {
+        // `render_chart` is noise here: its successful output is the chart
+        // block the terminal frame already appends to the reply.
+        if (!msg.name || msg.name === RENDER_CHART_TOOL) {
           break;
         }
         const toolName = msg.name;
@@ -709,7 +712,9 @@ export function AgentProvider({
         // Defense in depth (issue #7151): mirrors the `tool_call` guard
         // above. Observability `tool_result`-shaped telemetry would otherwise
         // overwrite the most recent pending tool card with an empty output.
-        if (!msg.name) {
+        // A successful `render_chart` result is consumed by the reply's chart
+        // block; a failed one falls through so the operator sees the error.
+        if (!msg.name || (msg.name === RENDER_CHART_TOOL && (msg.output ?? '').includes('```chart'))) {
           break;
         }
         const toolName = msg.name;

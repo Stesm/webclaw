@@ -28,6 +28,9 @@ const X_KEY = '__x';
 const TYPES: ChatChartType[] = ['line', 'bar', 'area', 'pie'];
 const SERIES_COLORS = ['#22d3ee', '#818cf8', '#f472b6', '#fbbf24', '#34d399', '#fb923c'];
 
+/** Tool whose successful output is the rendered chart itself. */
+export const RENDER_CHART_TOOL = 'render_chart';
+
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)

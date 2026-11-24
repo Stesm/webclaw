@@ -442,6 +442,11 @@ pub const BUILTIN_TOOLS: &[BuiltinToolSpec] = &[
         compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
+        name: "render_chart",
+        tier: ToolTier::Optional,
+        compilation: BuiltinToolCompilation::Always,
+    },
+    BuiltinToolSpec {
         name: "weather",
         tier: ToolTier::Optional,
         compilation: BuiltinToolCompilation::External,

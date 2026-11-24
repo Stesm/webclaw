@@ -1,5 +1,6 @@
 import type { SessionMessageRow, TurnProgress, WsAttachment } from '@/types/api';
 import { stripServerEnvelopes, isInternalTurnNudge } from '@/lib/serverEnvelope';
+import { RENDER_CHART_TOOL } from '@/components/chatChart.logic';
 
 const MAX_MESSAGES = 100;
 const PREFIX = 'zeroclaw_chat_history_v1:';
@@ -258,6 +259,7 @@ export function turnProgressToUiMessages(
   // none), and the accumulated text by a stable literal. The snapshot only
   // ever appends, so both stay stable as the turn grows.
   for (const [i, call] of progress.tool_calls.entries()) {
+    if (call.name === RENDER_CHART_TOOL) continue;
     const hasOutput = call.output !== undefined && call.output !== null;
     out.push({
       id: `live-tool:${call.id || `i${i}`}`,

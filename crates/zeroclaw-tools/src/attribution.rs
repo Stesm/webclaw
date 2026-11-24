@@ -77,6 +77,7 @@ use crate::proxy_config::ProxyConfigTool;
 #[cfg(feature = "tools-external")]
 use crate::pushover::PushoverTool;
 use crate::reaction::ReactionTool;
+use crate::render_chart::RenderChartTool;
 #[cfg(feature = "tool-project-intel")]
 use crate::report_template_tool::ReportTemplateTool;
 #[cfg(feature = "tools-external")]
@@ -104,6 +105,7 @@ tool_attribution!(BrowserDelegateTool, ToolKind::Plugin);
 #[cfg(feature = "tools-external")]
 tool_attribution!(BrowserOpenTool, ToolKind::Plugin);
 tool_attribution!(CalculatorTool, ToolKind::Plugin);
+tool_attribution!(RenderChartTool, ToolKind::Plugin);
 tool_attribution!(CanvasTool, ToolKind::Plugin);
 tool_attribution!(ChannelRoomTool, ToolKind::Plugin);
 #[cfg(feature = "tool-claude-code")]

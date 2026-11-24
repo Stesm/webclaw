@@ -1858,6 +1858,35 @@ fn event_matches_session(event: &serde_json::Value, session_id: &str) -> bool {
     event.get("session_id").and_then(|value| value.as_str()) == Some(session_id)
 }
 
+/// The `render_chart` tool returns exactly one fenced block as its output.
+fn chart_block_from_tool_output(output: &str) -> Option<String> {
+    let trimmed = output.trim();
+    (trimmed.starts_with("```chart\n") && trimmed.ends_with("```")).then(|| trimmed.to_string())
+}
+
+/// Chart blocks the assistant's own text does not already contain, so an echo
+/// is never rendered twice.
+fn missing_chart_blocks<'a>(response: &str, charts: &'a [String]) -> Vec<&'a str> {
+    charts
+        .iter()
+        .map(String::as_str)
+        .filter(|block| !response.contains(block))
+        .collect()
+}
+
+fn merge_chart_blocks(response: &str, charts: &[String]) -> String {
+    let missing = missing_chart_blocks(response, charts);
+    if missing.is_empty() {
+        return response.to_string();
+    }
+    let appended = missing.join("\n\n");
+    if response.trim().is_empty() {
+        appended
+    } else {
+        format!("{}\n\n{appended}", response.trim_end())
+    }
+}
+
 fn is_observability_telemetry(event: &serde_json::Value) -> bool {
     event.get("source").and_then(serde_json::Value::as_str) == Some("observability")
 }
@@ -2303,6 +2332,13 @@ async fn process_chat_message(
         Arc::new(parking_lot::Mutex::new(Vec::new()));
     let forward_attachments = Arc::clone(&turn_attachments);
 
+    // Inline chart blocks (from the `render_chart` tool) produced during this
+    // turn, in call order. Appended to the final assistant text so the client
+    // draws them in the reply and a reloaded transcript keeps them.
+    let turn_charts: Arc<parking_lot::Mutex<Vec<String>>> =
+        Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let forward_charts = Arc::clone(&turn_charts);
+
     // Same wall-clock budget the channel runtime gives one message. Without
     // this the turn is bounded only by the provider stream's idle timeout and
     // can hang for the whole connection lifetime, leaving the session `running`
@@ -2521,6 +2557,16 @@ async fn process_chat_message(
                                             let mut collected = forward_attachments.lock();
                                             if !collected.iter().any(|existing| existing.id == r.id) {
                                                 collected.push(r.clone());
+                                            }
+                                        }
+                                        if name == "render_chart"
+                                            && let Some(block) =
+                                                chart_block_from_tool_output(&output)
+                                        {
+                                            let mut collected = forward_charts.lock();
+                                            if !collected.iter().any(|existing| existing == &block)
+                                            {
+                                                collected.push(block);
                                             }
                                         }
                                         let mut frame = serde_json::json!({
@@ -2768,6 +2814,11 @@ async fn process_chat_message(
 
     match result {
         Ok(outcome) => {
+            // Charts a tool rendered during this turn are presentation, not
+            // model context: they join the terminal frame and the persisted
+            // assistant row, never the agent's in-memory history.
+            let charts = std::mem::take(&mut *turn_charts.lock());
+            let response_with_charts = merge_chart_blocks(&outcome.response, &charts);
             if let Some(ref backend) = state.session_backend {
                 persist_agent_conversation_state(backend.as_ref(), session_key, agent);
                 *persisted_watermark =
@@ -2778,6 +2829,11 @@ async fn process_chat_message(
                 let attachments = std::mem::take(&mut *turn_attachments.lock());
                 if !attachments.is_empty() {
                     let _ = backend.attach_to_last_assistant_message(session_key, &attachments);
+                }
+                let missing = missing_chart_blocks(&outcome.response, &charts);
+                if !missing.is_empty() {
+                    let _ = backend
+                        .append_to_last_assistant_message(session_key, &missing.join("\n\n"));
                 }
             }
 
@@ -2887,7 +2943,7 @@ async fn process_chat_message(
                 .as_deref()
                 .unwrap_or(&active_provider);
             let meta = DoneFrameMeta {
-                full_response: &outcome.response,
+                full_response: &response_with_charts,
                 input_tokens: usage_fold.total_input_tokens,
                 output_tokens: usage_fold.total_output_tokens,
                 tokens_used: total_tokens,
@@ -5187,6 +5243,34 @@ data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text
                 "{ty} observability frame must be dropped from chat WS"
             );
         }
+    }
+
+    #[test]
+    fn render_chart_output_is_recognised_as_one_block() {
+        let block = "```chart\n{\"type\":\"line\"}```";
+        assert_eq!(
+            chart_block_from_tool_output(&format!("  {block}\n")).as_deref(),
+            Some(block)
+        );
+        assert_eq!(chart_block_from_tool_output("Chart rendered."), None);
+        assert_eq!(chart_block_from_tool_output("```ts\nlet x = 1;\n```"), None);
+    }
+
+    #[test]
+    fn charts_join_the_response_without_duplicating_an_echo() {
+        let chart = "```chart\n{\"type\":\"line\"}```".to_string();
+        let charts = vec![chart.clone()];
+
+        assert_eq!(
+            merge_chart_blocks("Готово.", &charts),
+            format!("Готово.\n\n{chart}")
+        );
+        assert_eq!(merge_chart_blocks("", &charts), chart);
+        assert!(missing_chart_blocks(&format!("Ответ.\n\n{chart}"), &charts).is_empty());
+        assert_eq!(
+            merge_chart_blocks(&format!("Ответ.\n\n{chart}"), &charts),
+            format!("Ответ.\n\n{chart}")
+        );
     }
 
     #[tokio::test]

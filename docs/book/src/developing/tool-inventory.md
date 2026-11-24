@@ -233,7 +233,7 @@ application-owned tool source and for an optional-tools feature (proposed as
 
 | Family | Tools | Registered on a default config |
 |---|---|---|
-| Utilities | `calculator`, `weather`, `pushover`, `screenshot`, `image_info` | Always |
+| Utilities | `calculator`, `render_chart`, `weather`, `pushover`, `screenshot`, `image_info` | Always |
 | Browser | `browser_open`, `browser`, `browser_delegate`, `text_browser` | `browser_open` yes, because the browser section is enabled by default; the others no |
 | Network | `http_request`, `web_search_tool` | Yes, both default to enabled |
 | SaaS integrations | `notion`, `jira`, `linkedin`, `composio`, `google_workspace`, `microsoft365` | No |
@@ -247,11 +247,11 @@ application-owned tool source and for an optional-tools feature (proposed as
 Registration on a default config follows the config defaults:
 `[browser].enabled`, `[http_request].enabled`, `[web_search].enabled`, and
 `[backup].enabled` default to true, while `[browser].automation_enabled` and
-every other gate in this table is off or unset. Nine tier 3 tools therefore
-register on a default config: `calculator`, `weather`, `pushover`,
-`screenshot`, `image_info`, `browser_open`, `http_request`, `web_search_tool`,
-and `backup`. Existing configs receive these nine tools without opting in, so
-any later gating must first migrate them.
+every other gate in this table is off or unset. Ten tier 3 tools therefore
+register on a default config: `calculator`, `render_chart`, `weather`,
+`pushover`, `screenshot`, `image_info`, `browser_open`, `http_request`,
+`web_search_tool`, and `backup`. Existing configs receive these ten tools
+without opting in, so any later gating must first migrate them.
 
 ### Deviation from the FND-001 baseline
 

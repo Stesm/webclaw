@@ -64,6 +64,27 @@ pub(crate) fn has_committed_jsonl_import_receipts(workspace_dir: &Path) -> Resul
 const SETTLE_RUNNING_TURNS_SQL: &str = "UPDATE session_metadata \
      SET state = 'error', turn_started_at = NULL WHERE state = 'running'";
 
+/// Strip the ```` ```chart ```` blocks the gateway appends to the end of a
+/// stored assistant message after a turn, leaving the model-authored text.
+///
+/// The authoritative rewrite rebuilds rows from the in-memory history, which
+/// never saw those rendered blocks; matching on the stripped text lets the
+/// rewrite carry them over instead of dropping the charts on the next turn.
+fn strip_trailing_chart_blocks(content: &str) -> &str {
+    let mut end = content.trim_end().len();
+    while end > 0 {
+        let head = content[..end].trim_end();
+        let Some(start) = head.rfind("```chart") else {
+            break;
+        };
+        if !head[start..].trim_end().ends_with("```") || start + "```chart".len() >= head.len() {
+            break;
+        }
+        end = content[..start].trim_end().len();
+    }
+    &content[..end]
+}
+
 impl SqliteSessionBackend {
     /// Where the store for `workspace_dir` lives, whether or not it exists.
     pub fn db_path(workspace_dir: &Path) -> PathBuf {
@@ -319,16 +340,28 @@ impl SqliteSessionBackend {
         attachments_json: Option<&str>,
         now: &str,
     ) -> rusqlite::Result<()> {
+        Self::append_row_on(
+            conn,
+            session_key,
+            &message.role,
+            &message.content,
+            attachments_json,
+            now,
+        )
+    }
+
+    fn append_row_on(
+        conn: &Connection,
+        session_key: &str,
+        role: &str,
+        content: &str,
+        attachments_json: Option<&str>,
+        now: &str,
+    ) -> rusqlite::Result<()> {
         conn.execute(
             "INSERT INTO sessions (session_key, role, content, created_at, attachments)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                session_key,
-                message.role,
-                message.content,
-                now,
-                attachments_json
-            ],
+            params![session_key, role, content, now, attachments_json],
         )?;
         conn.execute(
             "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count)
@@ -346,33 +379,44 @@ impl SqliteSessionBackend {
         session_key: &str,
         messages: &[ChatMessage],
     ) -> rusqlite::Result<()> {
-        // The caller's in-memory history carries no attachment metadata, so a
-        // plain rebuild would drop the files every earlier turn delivered.
-        // Reattach them to the retained rows by matching role and content,
+        // The caller's in-memory history carries neither attachment metadata
+        // nor the rendered blocks the gateway appends after a turn, so a plain
+        // rebuild would drop them. Match the rows the in-memory history still
+        // has (trailing chart block stripped) and carry both facts over,
         // scanning from the end so appended turns keep their identity.
-        let preserved = Self::attachment_rows_on(conn, session_key)?;
+        let preserved = Self::preserved_rows_on(conn, session_key)?;
         conn.execute(
             "DELETE FROM sessions WHERE session_key = ?1",
             params![session_key],
         )?;
         let now = Utc::now().to_rfc3339();
-        let mut restored: Vec<Option<String>> = vec![None; messages.len()];
+        let mut restored: Vec<Option<(Option<String>, String)>> = vec![None; messages.len()];
         let mut cursor = messages.len();
         for (role, content, attachments_json) in preserved.into_iter().rev() {
+            let base = strip_trailing_chart_blocks(&content);
+            let rendered = content[base.len()..].to_string();
             while cursor > 0 {
                 cursor -= 1;
-                if messages[cursor].role == role && messages[cursor].content == content {
-                    restored[cursor] = Some(attachments_json);
+                if messages[cursor].role == role && messages[cursor].content == base {
+                    restored[cursor] = Some((attachments_json, rendered));
                     break;
                 }
             }
         }
-        for (message, attachments_json) in messages.iter().zip(restored.iter()) {
-            Self::append_on(
+        for (message, preserved) in messages.iter().zip(restored.iter()) {
+            let (attachments_json, rendered) = match preserved {
+                Some((attachments_json, rendered)) => {
+                    (attachments_json.as_deref(), rendered.as_str())
+                }
+                None => (None, ""),
+            };
+            let content = format!("{}{rendered}", message.content);
+            Self::append_row_on(
                 conn,
                 session_key,
-                message,
-                attachments_json.as_deref(),
+                &message.role,
+                &content,
+                attachments_json,
                 &now,
             )?;
         }
@@ -383,13 +427,14 @@ impl SqliteSessionBackend {
         Ok(())
     }
 
-    fn attachment_rows_on(
+    fn preserved_rows_on(
         conn: &Connection,
         session_key: &str,
-    ) -> rusqlite::Result<Vec<(String, String, String)>> {
+    ) -> rusqlite::Result<Vec<(String, String, Option<String>)>> {
         let mut stmt = conn.prepare(
             "SELECT role, content, attachments FROM sessions
-             WHERE session_key = ?1 AND attachments IS NOT NULL
+             WHERE session_key = ?1
+               AND (attachments IS NOT NULL OR instr(content, '```chart') > 0)
              ORDER BY id ASC",
         )?;
         let rows = stmt.query_map(params![session_key], |row| {
@@ -1129,6 +1174,27 @@ impl SessionBackend for SqliteSessionBackend {
                              WHERE session_key = ?1 AND role = 'assistant'
                              ORDER BY id DESC LIMIT 1)",
                 params![session_key, attachments_json],
+            )
+            .map_err(std::io::Error::other)?;
+        Ok(updated > 0)
+    }
+
+    fn append_to_last_assistant_message(
+        &self,
+        session_key: &str,
+        text: &str,
+    ) -> std::io::Result<bool> {
+        if text.trim().is_empty() {
+            return Ok(false);
+        }
+        let conn = self.conn.lock();
+        let updated = conn
+            .execute(
+                "UPDATE sessions SET content = content || ?2
+                 WHERE id = (SELECT id FROM sessions
+                             WHERE session_key = ?1 AND role = 'assistant'
+                             ORDER BY id DESC LIMIT 1)",
+                params![session_key, format!("\n\n{text}")],
             )
             .map_err(std::io::Error::other)?;
         Ok(updated > 0)
@@ -2006,6 +2072,53 @@ mod tests {
         assert_eq!(rows[0].attachments, vec![attachment]);
     }
 
+    #[test]
+    fn rewrite_carries_over_chart_blocks_appended_after_the_turn() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let attachment = AttachmentRef {
+            id: "abc123.pdf".to_string(),
+            filename: "report.pdf".to_string(),
+            title: "Quarterly report".to_string(),
+            mime: "application/pdf".to_string(),
+            size: 42,
+        };
+
+        backend.append("s", &ChatMessage::user("here")).unwrap();
+        backend
+            .append_with_attachments(
+                "s",
+                &ChatMessage::assistant("Отчёт"),
+                std::slice::from_ref(&attachment),
+            )
+            .unwrap();
+        assert!(
+            backend
+                .append_to_last_assistant_message("s", "```chart\n{\"type\":\"line\"}\n```")
+                .unwrap()
+        );
+
+        // The next turn rewrites from in-memory history, which never saw the
+        // rendered block.
+        backend
+            .rewrite_messages(
+                "s",
+                &[
+                    ChatMessage::user("here"),
+                    ChatMessage::assistant("Отчёт"),
+                    ChatMessage::user("дальше"),
+                ],
+            )
+            .unwrap();
+
+        let rows = backend.load_with_timestamps("s");
+        assert_eq!(
+            rows[1].message.content,
+            "Отчёт\n\n```chart\n{\"type\":\"line\"}\n```"
+        );
+        assert_eq!(rows[1].attachments, vec![attachment]);
+    }
+
     /// The authoritative post-turn replace rebuilds rows without attachment
     /// metadata; `attach_to_last_assistant_message` must stamp the turn's
     /// delivered files onto its final assistant row and leave everything else
@@ -2066,6 +2179,38 @@ mod tests {
         assert!(
             !backend
                 .attach_to_last_assistant_message("s", std::slice::from_ref(&attachment))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn append_to_last_assistant_message_extends_only_the_final_assistant_row() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("s", &ChatMessage::user("first")).unwrap();
+        backend
+            .append("s", &ChatMessage::assistant("older"))
+            .unwrap();
+        backend.append("s", &ChatMessage::user("second")).unwrap();
+        backend
+            .append("s", &ChatMessage::assistant("latest"))
+            .unwrap();
+
+        let block = "```chart\n{\"type\":\"line\"}\n```";
+        assert!(
+            backend
+                .append_to_last_assistant_message("s", block)
+                .unwrap()
+        );
+
+        let rows = backend.load("s");
+        assert_eq!(rows[1].content, "older");
+        assert_eq!(rows[3].content, format!("latest\n\n{block}"));
+        assert!(!backend.append_to_last_assistant_message("s", "  ").unwrap());
+        assert!(
+            !backend
+                .append_to_last_assistant_message("missing", block)
                 .unwrap()
         );
     }

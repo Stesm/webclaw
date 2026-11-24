@@ -133,6 +133,7 @@ pub use zeroclaw_tools::proxy_config::ProxyConfigTool;
 #[cfg(feature = "tools-external")]
 pub use zeroclaw_tools::pushover::PushoverTool;
 pub use zeroclaw_tools::reaction::ReactionTool;
+pub use zeroclaw_tools::render_chart::RenderChartTool;
 #[cfg(feature = "tool-project-intel")]
 pub use zeroclaw_tools::report_template_tool::ReportTemplateTool;
 #[cfg(feature = "tools-external")]
@@ -1798,6 +1799,7 @@ fn all_tools_with_runtime_on_thread(
         ))
     );
     register_tool!("calculator", Arc::new(CalculatorTool::new()));
+    register_tool!("render_chart", Arc::new(RenderChartTool::new()));
     #[cfg(feature = "tools-external")]
     register_tool!("weather", Arc::new(WeatherTool::new()));
     register_tool!(

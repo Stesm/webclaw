@@ -99,6 +99,7 @@ pub mod proxy_config;
 #[cfg(feature = "tools-external")]
 pub mod pushover;
 pub mod reaction;
+pub mod render_chart;
 #[cfg(feature = "tool-project-intel")]
 pub mod report_template_tool;
 #[cfg(feature = "tool-project-intel")]

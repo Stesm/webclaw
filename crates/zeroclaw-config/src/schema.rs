@@ -13948,6 +13948,7 @@ pub fn default_auto_approve() -> Vec<String> {
         "web_search_tool".into(),
         "web_fetch".into(),
         "calculator".into(),
+        "render_chart".into(),
         "glob_search".into(),
         "content_search".into(),
         "image_info".into(),

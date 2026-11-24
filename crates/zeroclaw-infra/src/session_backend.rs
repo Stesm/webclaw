@@ -249,6 +249,24 @@ pub trait SessionBackend: Send + Sync {
         Ok(false)
     }
 
+    /// Append rendered blocks (e.g. an inline ```` ```chart ```` the model's
+    /// tools produced) to the session's last assistant row.
+    ///
+    /// Same post-replace window as [`attach_to_last_assistant_message`]: the
+    /// client already received the blocks in the turn's terminal frame, and
+    /// this keeps a reloaded transcript identical to what the operator saw.
+    /// `false` (the default) means the backend has no editable transcript or
+    /// no matching assistant row; callers treat it as best-effort.
+    ///
+    /// [`attach_to_last_assistant_message`]: Self::attach_to_last_assistant_message
+    fn append_to_last_assistant_message(
+        &self,
+        _session_key: &str,
+        _text: &str,
+    ) -> std::io::Result<bool> {
+        Ok(false)
+    }
+
     /// Remove the last message from a session. Returns `true` if a message was removed.
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool>;
 
