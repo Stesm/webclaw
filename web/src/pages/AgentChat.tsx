@@ -23,10 +23,12 @@ import ApprovalBanner from '@/components/ApprovalBanner';
 import { resolveContextBarState } from '@/lib/contextBar';
 import SessionPicker from '@/components/SessionPicker';
 import ChatAttachmentCard from '@/components/ChatAttachmentCard';
+import ChatChart from '@/components/ChatChart';
 import AttachmentPreviewModal from '@/components/AttachmentPreviewModal';
 import type { WsAttachment } from '@/types/api';
 import { turnProgressToUiMessages } from '@/lib/chatHistoryStorage';
 import { stripServerEnvelopes } from '@/lib/serverEnvelope';
+import { chartSourceFromPre } from '@/components/chatChart.logic';
 
 const DRAFT_KEY_PREFIX = 'agent-chat';
 
@@ -39,6 +41,13 @@ const markdownComponents: Components = {
     ) : (
       <a {...props} href={href} target="_blank" rel="noopener noreferrer" />
     ),
+  // ```chart fences render as an interactive chart instead of a code block.
+  // The `pre` wrapper is where ReactMarkdown hands us the hast node, so the
+  // chart replaces the whole block rather than nesting inside <pre> styling.
+  pre: ({ node, children, ...props }) => {
+    const source = chartSourceFromPre(node);
+    return source === null ? <pre {...props}>{children}</pre> : <ChatChart source={source} />;
+  },
 };
 
 /** Format token count with commas (e.g., 12345 -> "12,345"). */

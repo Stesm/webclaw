@@ -732,6 +732,34 @@ code, kbd, pre {
 .chat-markdown th { background: var(--pc-accent-glow); font-weight: 600; }
 .chat-markdown img { max-width: 100%; border-radius: 0.5em; }
 
+/* ── Inline charts (```chart fences) ── */
+.chat-chart {
+  margin: 0.6em 0;
+  padding: 0.75em 0.875em 0.5em;
+  border: 1px solid var(--pc-border);
+  border-radius: 0.75em;
+  background: var(--pc-bg-surface);
+  overflow: hidden;
+}
+.chat-chart-title {
+  font-size: 0.8125em;
+  font-weight: 600;
+  color: var(--pc-text-primary);
+  margin-bottom: 0.25em;
+}
+.chat-chart-body { width: 100%; height: 260px; }
+.chat-chart-invalid {
+  margin: 0.6em 0;
+  padding: 0.6em 0.75em;
+  border: 1px dashed var(--pc-border);
+  border-radius: 0.5em;
+  color: var(--pc-text-muted);
+  font-size: 0.85em;
+}
+@media (max-width: 640px) {
+  .chat-chart-body { height: 220px; }
+}
+
 /* ── Accessibility: reduced motion ── */
 @media (prefers-reduced-motion: reduce) {
   .animate-fade-in,

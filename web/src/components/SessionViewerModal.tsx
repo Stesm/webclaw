@@ -3,6 +3,8 @@ import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Loader2, X } from 'lucide-react';
 import ToolCallCard from '@/components/ToolCallCard';
+import ChatChart from '@/components/ChatChart';
+import { chartSourceFromPre } from '@/components/chatChart.logic';
 import { Badge, Button } from '@/components/ui';
 import { getCronRunLog, getSessionMessages } from '@/lib/api';
 import { mapServerMessagesToPersisted } from '@/lib/chatHistoryStorage';
@@ -29,6 +31,10 @@ interface SessionViewerModalProps {
 
 const markdownComponents: Components = {
   a: ({ ...props }) => <a {...props} target="_blank" rel="noreferrer" />,
+  pre: ({ node, children, ...props }) => {
+    const source = chartSourceFromPre(node);
+    return source === null ? <pre {...props}>{children}</pre> : <ChatChart source={source} />;
+  },
 };
 
 function cronMessagesToViewer(messages: CronRunLogResponse['messages']): ViewerMessage[] {
